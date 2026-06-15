@@ -219,17 +219,25 @@ jobs:
       # e2e-ui suite (openai-agents) does not need it.
       # ----------------------------------------------------------------------
       - name: Install Claude Code CLI (TEMP)
-        # Pinned @anthropic-ai/claude-code from .github/ci-deps, same as e2e.yml.
+        # Install claude-code 2.1.170, NOT the 2.1.124 pinned in
+        # .github/ci-deps. 2.1.124 does not recognise the hook events the
+        # native bridge configures (InstructionsLoaded / CwdChanged /
+        # FileChanged) and shows a blocking "settings values skipped" modal on
+        # startup; the injected first message lands on that modal and is lost,
+        # so no turn ever runs. 2.1.170 accepts those events and boots straight
+        # to the prompt. (The ci-deps pin drives e2e.yml's claude-sdk/codex
+        # legs; bumping it there is a separate change with wider blast radius —
+        # tracked for the permanent native-harness wiring.)
         # --ignore-scripts blocks arbitrary postinstall; we then run claude-code's
         # own install.cjs explicitly (audited: platform detect + same-tree hardlink
         # of the native binary, no network/exec) and put its bin on PATH.
-        working-directory: .github/ci-deps
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          npm install --ignore-scripts
+          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
           node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Configure native-claude gateway provider (TEMP)
         # The runner derives Claude Code's gateway auth from omnigent provider
