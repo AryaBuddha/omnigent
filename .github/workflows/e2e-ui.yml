@@ -250,7 +250,13 @@ jobs:
               kind: gateway
               default: anthropic
               anthropic:
-                base_url: "${GATEWAY_BASE_URL}"
+                # Databricks serves the Anthropic Messages surface at
+                # <host>/serving-endpoints/anthropic (see
+                # omnigent/inner/pi_executor.py: claude_base_url). GATEWAY_BASE_URL
+                # is <host>/serving-endpoints (the OpenAI-compatible surface), so
+                # the /anthropic suffix is required — without it Claude Code POSTs
+                # to .../serving-endpoints/v1/messages and gets no reply.
+                base_url: "${GATEWAY_BASE_URL}/anthropic"
                 api_key_ref: "env:LLM_API_KEY"
                 # The default model id is read from models.default (not a
                 # top-level default_model key). Without it the provider
@@ -363,6 +369,7 @@ jobs:
             /tmp/pytest-of-runner/**/e2e_ui_server*/server.log
             /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
             /tmp/omnigent-*/claude-native/**
+            /home/runner/.claude/projects/**/*.jsonl
           retention-days: 3
           if-no-files-found: ignore
 
