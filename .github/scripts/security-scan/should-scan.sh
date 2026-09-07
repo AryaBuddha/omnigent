@@ -12,10 +12,8 @@
 # does not vouch for the contents of this one) and first-timers
 # (FIRST_TIME_CONTRIBUTOR / NONE).
 #
-# This gate is independent of fork-e2e/should-mirror.sh: that one gates secret-
-# bearing e2e on a maintainer's approving PR review, whereas this gate
-# decides whether to inspect for attacks and so errs toward scanning more (it
-# scans returning CONTRIBUTORs that the label gate would not by itself run).
+# This gate decides whether to inspect a PR for attacks and errs toward scanning
+# more (it scans returning CONTRIBUTORs, not just first-timers).
 #
 # author_association is computed by GitHub from the actor's relationship to the
 # repo at event time; it is not attacker-settable from PR contents.
@@ -40,6 +38,9 @@
 #
 # Env in:  EVENT_NAME          (github.event_name)
 #          AUTHOR_ASSOCIATION  (github.event.pull_request.author_association)
+#          PR_AUTHOR           (github.event.pull_request.user.login; trusted-CI-bot
+#                               allowlist, checked without an API call so the gate
+#                               pollers short-circuit too)
 #          MAINTAINERS         (space-separated, from merge-ready/load-maintainers.sh;
 #                               optional -- used only to trust private-membership
 #                               maintainer AUTHORS, not for the label waiver)
@@ -70,9 +71,8 @@ has_skip_label() {
 }
 
 # Only PRs carry untrusted contributor code through the gate. Every other
-# trigger -- push to main / fork-e2e/** (the mirror branch only exists after a
-# returning-contributor / maintainer-approval gate), schedule, dispatch -- is a
-# trusted context, so proceed without scanning. pull_request_review is still
+# trigger -- push to main, schedule, dispatch -- is a trusted context, so
+# proceed without scanning. pull_request_review is still
 # accepted (it carries the same pull_request + author_association fields, so the
 # gate evaluates identically) in case a workflow_call caller is wired to it, but
 # no workflow triggers a scan on review any more: the skip-security-scan waiver
@@ -105,6 +105,22 @@ author_is_maintainer() {
   done
   return 1
 }
+
+# Trusted CI bots (omni-resolve-agent, omnigent-ci) open SAME-REPO PRs from a
+# trusted internal pipeline via their GitHub App, and every such PR is still
+# gated by Maintainer Approval + human review before merge. The PR author login
+# is set by GitHub and is not settable from PR contents, and a fork PR's author
+# is never one of these bots. Checked from PR_AUTHOR with NO API call, so this
+# short-circuits the per-workflow gate pollers too (they pass no token) -- not
+# just the scan -- sparing the shared GITHUB_TOKEN budget their high PR volume
+# was exhausting. Add a login here only for a bot whose PRs are trusted to skip
+# the diff scan.
+TRUSTED_BOTS="omni-resolve-agent[bot] omnigent-ci[bot]"
+if [[ -n "${PR_AUTHOR:-}" ]]; then
+  for bot in $TRUSTED_BOTS; do
+    [[ "$PR_AUTHOR" == "$bot" ]] && { emit false "trusted CI bot ($PR_AUTHOR)"; exit 0; }
+  done
+fi
 
 case "${AUTHOR_ASSOCIATION:-}" in
   OWNER | MEMBER | COLLABORATOR)

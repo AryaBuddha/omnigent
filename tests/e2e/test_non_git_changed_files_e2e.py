@@ -459,7 +459,7 @@ def test_non_git_create_file(
     # The changes response must flag that tracking is limited for this non-git
     # workspace so the UI can explain *why* the list is partial (edits made
     # outside record_change — native-CLI/shell/external — are invisible here)
-    # instead of letting it read as a definitive "no changes" (issue #725).
+    # instead of letting it read as a definitive "no changes".
     changes_body = non_git_client.get(_changes_url(session_id)).json()
     assert changes_body["tracking"] == {
         "complete": False,

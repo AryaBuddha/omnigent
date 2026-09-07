@@ -33,15 +33,27 @@ import subprocess
 import sys
 import tarfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, cast
 
 import httpx
 import pytest
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.compat import (
+    apply_runner_env,
+    apply_server_env,
+    compat_runner_cwd,
+    compat_server_cwd,
+    meets_min_runner_version,
+    meets_min_server_version,
+    pinned_runner_version,
+    resolve_server_version,
+    runner_executable,
+    server_executable,
+)
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
@@ -63,6 +75,86 @@ def _skip_when_harness_cli_missing(request: pytest.FixtureRequest) -> None:
     harness = callspec.params.get("harness")
     if harness:
         skip_if_harness_cli_missing(harness)
+
+
+@pytest.fixture(scope="session")
+def server_version(live_server: str) -> str:
+    """Version of the live server under test (source of truth: GET /api/version).
+
+    In the backwards-compat workflow the server is a pinned older build, so
+    this can differ from the installed (test-process) version. See
+    :func:`tests._helpers.compat.resolve_server_version` and
+    ``docs/SERVER_VERSION_COMPAT_CI.md``.
+
+    :param live_server: Base URL of the live server, e.g.
+        ``"http://localhost:54321"``.
+    :returns: The server version string, e.g. ``"0.1.1"``.
+    """
+    return resolve_server_version(live_server)
+
+
+@pytest.fixture(autouse=True)
+def _enforce_min_server_version(request: pytest.FixtureRequest) -> None:
+    """Skip tests marked ``@pytest.mark.min_server_version(X)`` on older servers.
+
+    Resolves :func:`server_version` (and thus requires a live server) when a
+    test carries the marker OR when a compat run is active
+    (``OMNIGENT_COMPAT_SERVER_VERSION`` set). The latter makes the
+    ``/api/version`` ↔ env cross-check (the PYTHONPATH/CWD-shadow tripwire in
+    :func:`resolve_server_version`) fire once per session even before any
+    feature has a marker. In normal runs with no marker, nothing is resolved,
+    so non-server tests are unaffected.
+
+    Comparison is on the PEP 440 release tuple, so a ``.devN`` of ``X``
+    satisfies ``min_server_version("X")``.
+
+    :param request: The pytest request, used to read the marker and lazily
+        resolve the ``server_version`` fixture.
+    """
+    marker = request.node.get_closest_marker("min_server_version")
+    compat_pinned = os.environ.get("OMNIGENT_COMPAT_SERVER_VERSION")
+    if marker is None and not compat_pinned:
+        return
+    # Resolving server_version cross-checks /api/version against the pinned
+    # version and fails loud on a shadow (server running the wrong code).
+    server_ver = request.getfixturevalue("server_version")
+    if marker is None:
+        return
+    if not marker.args:
+        raise pytest.UsageError("min_server_version marker requires a version argument")
+    required = marker.args[0]
+    if not meets_min_server_version(server_ver, required):
+        pytest.skip(f"requires server >= {required}; running {server_ver}")
+
+
+@pytest.fixture(autouse=True)
+def _enforce_min_runner_version(request: pytest.FixtureRequest) -> None:
+    """Skip tests marked ``@pytest.mark.min_runner_version(X)`` on older runners/hosts.
+
+    The runner/host backwards-compat run (Config 2) pins the
+    ``omnigent.runner._entry`` / ``omnigent.host._daemon_entry`` subprocesses to
+    an older build and sets ``OMNIGENT_COMPAT_RUNNER_VERSION``. The runner/host
+    expose no ``/api/version`` endpoint, so — unlike the server skip — the
+    version comes purely from that env backstop
+    (:func:`tests._helpers.compat.pinned_runner_version`); ``None`` (normal
+    runs) means "newest", so unmarked / non-compat runs skip nothing.
+
+    Comparison is on the PEP 440 release tuple, so a ``.devN`` of ``X``
+    satisfies ``min_runner_version("X")``.
+
+    :param request: The pytest request, used to read the marker.
+    """
+    marker = request.node.get_closest_marker("min_runner_version")
+    if marker is None:
+        return
+    if not marker.args:
+        raise pytest.UsageError("min_runner_version marker requires a version argument")
+    pinned = pinned_runner_version()
+    if pinned is None:
+        return
+    required = marker.args[0]
+    if not meets_min_runner_version(pinned, required):
+        pytest.skip(f"requires runner >= {required}; running {pinned}")
 
 
 # Agent bundle directories relative to repo root.
@@ -198,22 +290,15 @@ def using_mock_llm(request: pytest.FixtureRequest) -> bool:
     return request.config.getoption("--llm-api-key") is None
 
 
-@pytest.fixture(scope="session")
-def mock_llm_server_url(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[str]:
+def _mock_llm_server_process(log_dir: Path) -> Iterator[str]:
     """
-    Start a mock LLM server for the test session.
+    Run a mock gateway with its own response queues and request ledger.
 
-    Always started regardless of ``--llm-api-key`` so mock-only
-    e2e tests run alongside real-LLM tests in the same session.
-    The mock server is a lightweight FastAPI/uvicorn subprocess.
-
-    :param tmp_path_factory: Pytest temp path factory for logs.
+    :param log_dir: Existing directory for the subprocess log.
     :returns: The mock server base URL.
     """
     mock_port = find_free_port()
-    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    mock_log = log_dir / "mock_llm.log"
     log_handle = open(mock_log, "w")  # noqa: SIM115
 
     proc = subprocess.Popen(
@@ -259,11 +344,34 @@ def mock_llm_server_url(
         log_handle.close()
 
 
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """
+    Start a mock LLM server for the test session.
+
+    Always started regardless of ``--llm-api-key`` so mock-only
+    e2e tests run alongside real-LLM tests in the same session.
+
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :returns: The mock server base URL.
+    """
+    yield from _mock_llm_server_process(tmp_path_factory.mktemp("mock_llm_logs"))
+
+
+@pytest.fixture
+def isolated_mock_llm_server_url(tmp_path: Path) -> Iterator[str]:
+    """Give one test a gateway whose request ledger cannot receive earlier tests' calls."""
+    yield from _mock_llm_server_process(tmp_path)
+
+
 def configure_mock_llm(
     mock_llm_server_url: str | None,
     responses: list[dict[str, Any]],
     *,
     key: str = "default",
+    match: str | None = None,
 ) -> None:
     """
     Configure a keyed response queue on the mock LLM server.
@@ -283,19 +391,41 @@ def configure_mock_llm(
         configure_mock_llm(url, [{"text": "LGTM"}],
                            key="mock-reviewer")
 
+    Pass *match* to route by request CONTENT instead of model: the queue
+    serves any request whose ``role="user"`` input contains the token.
+    This lets a test claim its own queue by the unique message it sends,
+    so a stray/late request from another test can't draw from it — the
+    fix for the #523 cross-test contamination flake without per-test
+    mock servers::
+
+        configure_mock_llm(url, [...], match="mangosteen-tr")
+        # and the test does child.send("mangosteen-tr ...")
+
     :param mock_llm_server_url: Mock server URL or ``None``.
     :param responses: List of response configs. Keys:
         ``text``, ``tool_calls``, ``block``, ``stream``,
-        ``error``, ``status_code``.
+        ``error``, ``status_code``, ``delay`` (seconds to pause
+        before returning this response).
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
+    :param match: Optional content-routing token. When set, the queue is
+        selected if this token appears in the request's user input,
+        regardless of ``model``. Use a deliberately-unique token (the
+        message the test sends). Also used as the queue *key* when *key*
+        is left at its default, so each match-routed queue is distinct.
     """
     if mock_llm_server_url is None:
         return
+    payload: dict[str, Any] = {
+        "key": match if (match is not None and key == "default") else key,
+        "responses": responses,
+    }
+    if match is not None:
+        payload["match"] = match
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
-        json={"key": key, "responses": responses},
+        json=payload,
         timeout=5.0,
     )
     resp.raise_for_status()
@@ -338,6 +468,27 @@ def set_fallback_mock_llm(
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/set_fallback",
         json={"key": key, "text": text},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def set_mock_served_models(mock_llm_server_url: str | None, models: list[str]) -> None:
+    """
+    Set the model ids the mock gateway reports on ``GET /v1/models``.
+
+    The claude-sdk executor lists its gateway's models once per session to
+    pin Claude Code's family aliases to served ids. Cleared by
+    :func:`reset_mock_llm`, so set it after the reset.
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    :param models: Served model ids, e.g. ``["gw-claude-opus-4-8"]``.
+    """
+    if mock_llm_server_url is None:
+        return
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/served_models",
+        json={"models": models},
         timeout=5.0,
     )
     resp.raise_for_status()
@@ -426,7 +577,7 @@ def openai_judge_api_key(
     )
 
 
-_live_runner_state: dict[str, str] = {}
+_live_runner_state: dict[str, Any] = {}
 
 
 @pytest.fixture(scope="session")
@@ -515,9 +666,12 @@ def live_server(
     env = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_BUILTIN_AGENT_DIRS": str(builtin_sdk_chat_spec),
     }
+    # Prepend the worktree so the server imports the branch's source (see
+    # comment above). Dropped in compat mode so the pinned older server in
+    # the compat venv resolves instead of being shadowed by main.
+    apply_server_env(env, _REPO_ROOT)
     if using_mock_llm and mock_llm_server_url is not None:
         # Mock mode: point all LLM calls at the mock server.
         # The OpenAI SDK appends /responses to the base URL, so
@@ -556,7 +710,10 @@ def live_server(
     # 401s under ``--profile``. Point it at the same gateway the
     # agent executors use so prompt-policy e2e tests can classify.
     server_args = [
-        sys.executable,
+        # Compat-aware: the test process's python normally, the pinned old
+        # server's venv python in compat mode. The runner below stays on
+        # sys.executable (it tracks the test process / client version).
+        server_executable(),
         "-m",
         "omnigent.cli",
         "server",
@@ -610,26 +767,44 @@ def live_server(
             **env,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         },
+        # Compat mode: neutral CWD so the worktree omnigent/ doesn't shadow
+        # the pinned old install via sys.path[0]. None (inherit) otherwise.
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
     base_url = f"http://localhost:{port}"
 
     # ── Spawn runner as sibling subprocess ───────────────
+    # Compat-aware: the test process's python normally, the pinned OLD runner's
+    # venv python in runner compat mode (Config 2). apply_runner_env drops the
+    # inherited worktree PYTHONPATH in that mode so the old build resolves; the
+    # server above is independently main or old per its own knob.
     runner_log = tmp_path_factory.mktemp("e2e_logs") / "runner.log"
     runner_log_handle = open(runner_log, "w")  # noqa: SIM115
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env={
+    runner_env = apply_runner_env(
+        {
             **env,
             "OMNIGENT_RUNNER_ID": runner_id,
             "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
             "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
             "RUNNER_SERVER_URL": base_url,
-        },
+        }
+    )
+    runner_proc = subprocess.Popen(
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=runner_env,
+        cwd=compat_runner_cwd(),
         stdout=runner_log_handle,
         stderr=subprocess.STDOUT,
     )
+    # Keep the mutable process handle visible to restart E2E tests. The server
+    # fixture still owns final cleanup, including whichever generation is live.
+    _live_runner_state["process"] = runner_proc
+    _live_runner_state["args"] = [runner_executable(), "-m", "omnigent.runner._entry"]
+    _live_runner_state["env"] = runner_env
+    _live_runner_state["cwd"] = compat_runner_cwd()
+    _live_runner_state["log_handle"] = runner_log_handle
 
     health_iters = int(HEALTH_TIMEOUT_S / POLL_INTERVAL_S)
     for _ in range(health_iters):
@@ -677,6 +852,7 @@ def live_server(
     try:
         yield base_url
     finally:
+        runner_proc = _live_runner_state.get("process", runner_proc)
         if runner_proc.poll() is None:
             runner_proc.send_signal(signal.SIGTERM)
             try:
@@ -692,6 +868,71 @@ def live_server(
             proc.kill()
             proc.wait(timeout=5)
         log_handle.close()
+
+
+@pytest.fixture
+def restart_live_runner(live_server: str, live_runner_id: str) -> Callable[[], None]:
+    """
+    Return a callback that kills and replaces the live runner subprocess.
+
+    The replacement uses the same runner id, tunnel binding, environment, and
+    server. This models a process crash/restart without resetting durable server
+    state, which is the lifecycle boundary restart recovery must survive.
+
+    :param live_server: Base URL of the live server kept across the restart.
+    :param live_runner_id: Stable runner identity reused by the replacement.
+    :returns: Callback that completes after the replacement tunnel is online.
+    """
+
+    def restart() -> None:
+        old_proc = cast(subprocess.Popen[bytes], _live_runner_state["process"])
+        old_proc.kill()
+        old_proc.wait(timeout=10)
+
+        # Do not mistake the dead tunnel's briefly stale registry entry for the
+        # replacement connection; observe the disconnect before starting it.
+        disconnect_deadline = time.monotonic() + HEALTH_TIMEOUT_S
+        while time.monotonic() < disconnect_deadline:
+            response = httpx.get(
+                f"{live_server}/v1/runners/{live_runner_id}/status",
+                timeout=2,
+            )
+            if response.status_code == 200 and response.json().get("online") is False:
+                break
+            time.sleep(POLL_INTERVAL_S)
+        else:
+            raise AssertionError("killed runner tunnel remained online before restart")
+
+        replacement = subprocess.Popen(
+            cast(list[str], _live_runner_state["args"]),
+            env=cast(dict[str, str], _live_runner_state["env"]),
+            cwd=cast(str | None, _live_runner_state["cwd"]),
+            stdout=cast(IO[bytes], _live_runner_state["log_handle"]),
+            stderr=subprocess.STDOUT,
+        )
+        _live_runner_state["process"] = replacement
+
+        deadline = time.monotonic() + HEALTH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if replacement.poll() is not None:
+                raise AssertionError(
+                    f"replacement runner exited early with code {replacement.returncode}"
+                )
+            try:
+                response = httpx.get(
+                    f"{live_server}/v1/runners/{live_runner_id}/status",
+                    timeout=2,
+                )
+                if response.status_code == 200 and response.json().get("online") is True:
+                    return
+            except httpx.HTTPError:
+                # The server may briefly refuse connections while the tunnel
+                # re-registers; keep polling until the deadline.
+                pass
+            time.sleep(POLL_INTERVAL_S)
+        raise AssertionError("replacement runner did not reconnect before timeout")
+
+    return restart
 
 
 @pytest.fixture(scope="session")
@@ -869,6 +1110,80 @@ def register_inline_agent(
         raise RuntimeError(
             f"[{harness}] agent register failed: {resp.status_code} {resp.text[:500]}"
         )
+    return name
+
+
+def register_dir_agent_with_mock_llm(
+    client: httpx.Client,
+    *,
+    agent_dir: Path,
+    name: str,
+    model: str,
+    mock_llm_base_url: str,
+) -> str:
+    """
+    Register a directory-bundle agent that ships its function tools as
+    Python source under ``tools/python/``, routed at a mock LLM.
+
+    Unlike :func:`register_inline_agent` (a single ``<name>.yaml`` whose
+    tool callables are dotted import paths), this tars *agent_dir* — whose
+    ``tools/python/*.py`` files the server loads by absolute file path from
+    the unpacked bundle (auto-discovered, like the ``archer`` fixture). So
+    the tools resolve on any server version without the server importing
+    the repo's ``tests/`` tree — the server-version backwards-compat failure
+    mode that dotted ``tests.*`` callables hit when the server is isolated.
+
+    The bundle's ``config.yaml`` is stamped per call: ``name`` and
+    ``executor.model`` are overridden and an ``executor.auth`` api-key block
+    is injected so the openai-agents harness hits the mock server.
+
+    :param client: HTTP client pointed at the server.
+    :param agent_dir: Fixture dir with ``config.yaml`` + ``tools/python/*.py``,
+        e.g. ``tests/resources/agents/decorator-tools``.
+    :param name: Agent name; suffixed per rerun attempt like
+        :func:`register_inline_agent` so llm_flaky rotation isn't defeated.
+    :param model: Mock model key (must match the ``configure_mock_llm`` key).
+    :param mock_llm_base_url: Mock server base URL including ``/v1``.
+    :returns: The registered agent name (use the return value, not *name*).
+    """
+    import json as _json
+
+    attempt = current_attempt()
+    if attempt > 0:
+        name = f"{name}-r{attempt}"
+
+    config = yaml.safe_load((agent_dir / "config.yaml").read_text())
+    config["name"] = name
+    executor = config.setdefault("executor", {})
+    executor["model"] = resolve_model(model)
+    executor["auth"] = {
+        "type": "api_key",
+        "api_key": "mock-key",
+        "base_url": mock_llm_base_url,
+    }
+
+    with io.BytesIO() as buf:
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            cfg_bytes = yaml.dump(config).encode()
+            info = tarfile.TarInfo("config.yaml")
+            info.size = len(cfg_bytes)
+            tar.addfile(info, io.BytesIO(cfg_bytes))
+            # Ship the rest of the bundle (tools/python/*.py, etc.) verbatim;
+            # the stamped config.yaml above replaces the on-disk one.
+            for entry in sorted(agent_dir.rglob("*")):
+                if not entry.is_file() or entry.relative_to(agent_dir) == Path("config.yaml"):
+                    continue
+                tar.add(str(entry), arcname=str(entry.relative_to(agent_dir)))
+        bundle = buf.getvalue()
+
+    resp = client.post(
+        "/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    if resp.status_code not in (200, 201, 409):
+        raise RuntimeError(f"dir-agent register failed: {resp.status_code} {resp.text[:500]}")
     return name
 
 
@@ -1452,20 +1767,28 @@ def poll_session_until_terminal(
     """
     deadline = time.monotonic() + timeout
     last_body: dict[str, Any] = {}
+    # A queued turn reads ``idle`` until the runner dispatches it, so accept
+    # ``idle`` as terminal only once the turn has started — seen as a
+    # running/waiting edge, or as real output (a non-user, non-resource_event
+    # item) for turns that finish between polls. ``failed`` is always terminal.
+    seen_running = False
     while time.monotonic() < deadline:
         resp = client.get(f"/v1/sessions/{session_id}")
         resp.raise_for_status()
         last_body = resp.json()
         status = last_body.get("status")
-        if status in ("idle", "failed"):
-            output = [
-                flattened
-                for item in last_body.get("items", [])
-                if not (
-                    (flattened := _flatten_session_item(item)).get("type") == "message"
-                    and flattened.get("role") == "user"
-                )
-            ]
+        if status in ("running", "waiting"):
+            seen_running = True
+        output = [
+            flattened
+            for item in last_body.get("items", [])
+            if not (
+                (flattened := _flatten_session_item(item)).get("type") == "message"
+                and flattened.get("role") == "user"
+            )
+        ]
+        has_turn_output = any(item.get("type") != "resource_event" for item in output)
+        if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
             return {
                 "id": response_id,
                 "status": "completed" if status == "idle" else "failed",
@@ -1580,8 +1903,10 @@ def resume_test_server(
     env = {
         **os.environ,
         "OPENAI_API_KEY": llm_api_key,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
     }
+    # Worktree shadow in normal mode; dropped in compat mode (see the
+    # primary live_server fixture above).
+    apply_server_env(env, _REPO_ROOT)
     if databricks_workspace_host is not None:
         env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
     # See docstring: an allow-list would reject the CLI's own runner.
@@ -1590,7 +1915,7 @@ def resume_test_server(
     log_handle = open(server_log, "w")  # noqa: SIM115 — lives for the Popen lifetime; closed in finally
     proc = subprocess.Popen(
         [
-            sys.executable,
+            server_executable(),
             "-m",
             "omnigent.cli",
             "server",
@@ -1602,6 +1927,8 @@ def resume_test_server(
             str(artifact_dir),
         ],
         env=env,
+        # Compat mode: neutral CWD (see the primary live_server fixture).
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )

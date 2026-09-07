@@ -123,6 +123,11 @@ def _build_tool_call() -> Executor:
                 name="echo_tool",
                 status=ToolCallStatus.SUCCESS,
                 result="tool result",
+                # A handles_tools_internally executor (e.g. antigravity) stamps
+                # the request's real call_id on the completion too, so the
+                # observed function_call and its function_call_output pair
+                # downstream (an id-less completion cannot pair and is dropped).
+                metadata={"call_id": "call_test_1"},
             ),
             TurnComplete(response=None),
         ]
@@ -141,6 +146,35 @@ def _build_error() -> Executor:
     """
     executor = MockExecutor()
     executor._turns.append([ExecutorError(message="mock error")])
+    return executor
+
+
+def _build_error_with_usage() -> Executor:
+    """
+    MockExecutor scripted with an :class:`ExecutorError` carrying usage.
+
+    Mirrors a turn that failed after the model call started: the executor
+    observed the prompt size before dying, so the error carries it and the
+    scaffold's ``response.failed`` terminal event must surface it (else the
+    context-occupancy meter freezes at the previous turn's value).
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            ExecutorError(
+                message="mock error after usage observed",
+                usage={
+                    "input_tokens": 400,
+                    "output_tokens": 0,
+                    "total_tokens": 400,
+                    "context_tokens": 100_000,
+                    "model": "mock-model",
+                },
+            )
+        ]
+    )
     return executor
 
 
@@ -175,6 +209,7 @@ _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
     "error": _build_error,
+    "error_with_usage": _build_error_with_usage,
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
 }

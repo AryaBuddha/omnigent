@@ -16,24 +16,32 @@ import pytest
 
 from omnigent.cursor_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
+    FORK_HISTORY_CLOSE_TAG,
+    FORK_HISTORY_OPEN_TAG,
     _paste_payload_bytes,
     allow_mcp_tools_in_cli_config,
     approve_mcp_server_for_workspace,
     bridge_dir_for_session_id,
     build_cursor_native_spawn_env,
     build_mcp_config,
+    clear_fork_preamble,
     cursor_project_key,
     enable_mcp_for_workspace,
+    read_fork_preamble,
     read_tmux_info,
+    wrap_fork_preamble,
+    write_fork_preamble,
     write_mcp_bridge_config,
     write_mcp_config,
     write_tmux_target,
 )
+from omnigent.inner import cursor_native_executor as cne
 from omnigent.inner.cursor_native_executor import (
     CursorNativeExecutor,
     _content_to_text,
     _latest_user_text,
 )
+from omnigent.inner.executor import ExecutorError
 
 
 class TestContentExtraction:
@@ -44,10 +52,12 @@ class TestContentExtraction:
         content = [
             {"type": "input_text", "text": "one"},
             {"type": "text", "text": "two"},
-            # invalid data URI -> materialize_attachment returns None -> no line
+            # invalid data URI -> not materialized -> visible marker line
             {"type": "input_image", "image_url": "data:..."},
         ]
-        assert _content_to_text(content, tmp_path) == "one\n\ntwo"
+        assert _content_to_text(content, tmp_path) == (
+            "[Attachment attachment could not be loaded]\n\none\n\ntwo"
+        )
 
     def test_real_image_attachment_materialized(self, tmp_path: Path) -> None:
         # a tiny valid base64 PNG data URI should be written to disk + referenced
@@ -82,6 +92,120 @@ class TestExecutorCapabilities:
         assert ex.supports_live_message_queue() is True
 
 
+class TestForkPreamble:
+    """The fork preamble file + sentinel framing (text-prefix replay)."""
+
+    def test_read_does_not_consume_clear_does(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "You: hi")
+        # Read is idempotent (the file survives) so a failed/retried injection
+        # can re-read it; only clear consumes.
+        assert read_fork_preamble(tmp_path) == "You: hi"
+        assert read_fork_preamble(tmp_path) == "You: hi"
+        clear_fork_preamble(tmp_path)
+        assert read_fork_preamble(tmp_path) is None
+
+    def test_empty_preamble_is_not_written(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "")
+        assert read_fork_preamble(tmp_path) is None
+
+    def test_read_missing_is_none_and_clear_is_noop(self, tmp_path: Path) -> None:
+        assert read_fork_preamble(tmp_path) is None
+        clear_fork_preamble(tmp_path)  # no file -> no error
+
+    def test_wrap_fences_preamble_before_user_text(self) -> None:
+        wrapped = wrap_fork_preamble("Conversation so far:\nuser: hi", "do it")
+        assert wrapped.startswith(FORK_HISTORY_OPEN_TAG)
+        assert FORK_HISTORY_CLOSE_TAG in wrapped
+        # The user's real text follows the fenced block.
+        assert wrapped.endswith("do it")
+        assert wrapped.index(FORK_HISTORY_CLOSE_TAG) < wrapped.index("do it")
+
+    def test_wrap_defangs_sentinels_inside_preamble(self) -> None:
+        # A literal close tag in the replayed transcript must not produce a second
+        # real close tag inside the block (which would let the forwarder's strip
+        # stop early and leak history). The framed block holds exactly one pair.
+        wrapped = wrap_fork_preamble(f"You: see {FORK_HISTORY_CLOSE_TAG} here", "go")
+        assert wrapped.count(FORK_HISTORY_CLOSE_TAG) == 1
+        assert wrapped.count(FORK_HISTORY_OPEN_TAG) == 1
+        # The defanged form stays readable.
+        assert "[/omnigent_fork_history]" in wrapped
+
+
+class TestRunTurnPreambleInjection:
+    """run_turn prepends the fork preamble to the FIRST injected message only."""
+
+    @pytest.mark.asyncio
+    async def test_first_turn_injects_preamble_then_consumes_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        injected: list[str] = []
+        monkeypatch.setattr(
+            cne,
+            "inject_user_message",
+            lambda bridge_dir, content: injected.append(content),
+        )
+        write_fork_preamble(tmp_path, "You: earlier")
+        ex = CursorNativeExecutor(bridge_dir=tmp_path)
+
+        # First turn: the preamble rides into the injected text, fenced.
+        async for _ in ex.run_turn([{"role": "user", "content": "first"}], [], ""):
+            pass
+        assert FORK_HISTORY_OPEN_TAG in injected[0]
+        assert "You: earlier" in injected[0]
+        assert injected[0].endswith("first")
+
+        # Second turn: preamble consumed -> plain user text only.
+        async for _ in ex.run_turn([{"role": "user", "content": "second"}], [], ""):
+            pass
+        assert injected[1] == "second"
+
+    @pytest.mark.asyncio
+    async def test_failed_injection_preserves_preamble_for_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If the FIRST injection fails (e.g. the TUI exited), the preamble must
+        # NOT be consumed — otherwise the forked history is lost permanently and
+        # a retried first turn launches with no prior context.
+        injected: list[str] = []
+        calls = {"n": 0}
+
+        def fake_inject(bridge_dir: Path, content: str) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("tmux target not advertised")
+            injected.append(content)
+
+        monkeypatch.setattr(cne, "inject_user_message", fake_inject)
+        write_fork_preamble(tmp_path, "You: earlier")
+        ex = CursorNativeExecutor(bridge_dir=tmp_path)
+
+        # First turn: injection fails -> ExecutorError, preamble still on disk.
+        events = [e async for e in ex.run_turn([{"role": "user", "content": "first"}], [], "")]
+        assert any(isinstance(e, ExecutorError) for e in events)
+        assert read_fork_preamble(tmp_path) == "You: earlier"
+
+        # Retry: injection succeeds, history rides along, THEN it's consumed.
+        async for _ in ex.run_turn([{"role": "user", "content": "first"}], [], ""):
+            pass
+        assert "You: earlier" in injected[0]
+        assert read_fork_preamble(tmp_path) is None
+
+    @pytest.mark.asyncio
+    async def test_no_preamble_injects_plain_text(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        injected: list[str] = []
+        monkeypatch.setattr(
+            cne,
+            "inject_user_message",
+            lambda bridge_dir, content: injected.append(content),
+        )
+        ex = CursorNativeExecutor(bridge_dir=tmp_path)
+        async for _ in ex.run_turn([{"role": "user", "content": "hello"}], [], ""):
+            pass
+        assert injected == ["hello"]
+
+
 class TestPastePayload:
     def test_newlines_become_cr(self) -> None:
         assert _paste_payload_bytes("a\nb") == b"a\rb"
@@ -97,6 +221,18 @@ class TestPastePayload:
 
 
 class TestBridge:
+    @pytest.fixture
+    def bridge_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A bridge dir under a production-shaped cursor root.
+
+        ``write_mcp_bridge_config`` hardens the token tree via
+        ``_ensure_secure_dir``, which only accepts dirs below a known bridge root,
+        so mirror the real ``<uid-scoped temp>/cursor-native/<digest>`` layout.
+        """
+        root = tmp_path / "omnigent-test" / "cursor-native"
+        monkeypatch.setattr("omnigent.cursor_native_bridge._BRIDGE_ROOT", root)
+        return root / "sess"
+
     def test_bridge_dir_is_deterministic_and_session_scoped(self) -> None:
         a1 = bridge_dir_for_session_id("conv_a")
         a2 = bridge_dir_for_session_id("conv_a")
@@ -138,9 +274,10 @@ class TestBridge:
         assert server["autoApprove"] == sorted(server["autoApprove"])
         assert server["env"]["TMPDIR"]
 
-    def test_write_mcp_config_is_workspace_scoped(self, tmp_path: Path, monkeypatch) -> None:
+    def test_write_mcp_config_is_workspace_scoped(
+        self, tmp_path: Path, bridge_dir: Path, monkeypatch
+    ) -> None:
         workspace = tmp_path / "workspace"
-        bridge_dir = tmp_path / "bridge"
         monkeypatch.setattr(
             "omnigent.cursor_native_bridge.approve_mcp_server_for_workspace",
             lambda _workspace: pytest.fail("approval must happen after tool relay starts"),
@@ -152,11 +289,48 @@ class TestBridge:
         assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
         assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
 
-    def test_write_mcp_bridge_config_is_idempotent(self, tmp_path: Path) -> None:
-        write_mcp_bridge_config(tmp_path)
-        first = (tmp_path / "bridge.json").read_text(encoding="utf-8")
-        write_mcp_bridge_config(tmp_path)
-        assert (tmp_path / "bridge.json").read_text(encoding="utf-8") == first
+    def test_write_mcp_config_preserves_user_servers(
+        self, tmp_path: Path, bridge_dir: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"atlassian": {"command": "atlassian-mcp"}},
+                    "someOtherKey": {"keep": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["mcpServers"]["atlassian"] == {"command": "atlassian-mcp"}
+        assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+        assert payload["someOtherKey"] == {"keep": True}
+
+    @pytest.mark.parametrize("body", ["[]", "null", '"text"', '{"mcpServers": null}', "not json"])
+    def test_write_mcp_config_survives_malformed_config(
+        self, tmp_path: Path, bridge_dir: Path, body: str
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "mcp.json").write_text(body, encoding="utf-8")
+
+        path = write_mcp_config(workspace, bridge_dir, python_executable="python-test")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+
+    def test_write_mcp_bridge_config_is_idempotent(self, bridge_dir: Path) -> None:
+        write_mcp_bridge_config(bridge_dir)
+        first = (bridge_dir / "bridge.json").read_text(encoding="utf-8")
+        write_mcp_bridge_config(bridge_dir)
+        assert (bridge_dir / "bridge.json").read_text(encoding="utf-8") == first
 
     def test_cursor_project_key_matches_cursor_workspace_state(self) -> None:
         assert cursor_project_key(Path("/Users/corey.zumar")) == "Users-corey.zumar"

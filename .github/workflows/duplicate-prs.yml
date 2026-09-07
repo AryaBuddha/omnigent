@@ -3,10 +3,10 @@ name: Duplicate PRs
 # Closes duplicate community PRs that reference the same issue: when more than
 # one open PR (created in the last 14 days) closes the same issue, the oldest is
 # kept and the newer ones are closed, labeled `duplicate`, and commented on.
-# Maintainer-authored PRs are never touched. Runs every 4 hours (and on demand)
-# rather than per-PR, so a freshly opened PR is only flagged once a real
-# duplicate exists. Never checks out or runs PR code -- it reads PR metadata via
-# the API using only the default-branch script. See duplicate-prs.js.
+# Maintainer-authored PRs are never closed, and trusted resolve-agent replacement
+# PRs are exempt so the contributor's original stays open until the replacement
+# merges. Runs every 4 hours (and on demand) rather than per-PR. Never checks out
+# or runs PR code -- it reads PR metadata via the default-branch script.
 
 on:
   schedule:
@@ -39,7 +39,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github
-      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           retries: 3
           script: |

@@ -119,6 +119,15 @@ class DrainedInput:
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
+    stable_id: str | None = None
+
+
+@dataclass
+class MatchedDrain:
+    """Result from draining pending inputs up to a text-matched entry."""
+
+    matched: DrainedInput | None
+    skipped: list[DrainedInput]
 
 
 @dataclass
@@ -146,6 +155,7 @@ class _Entry:
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
+    stable_id: str | None = None
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
@@ -185,6 +195,7 @@ def record(
     conversation_id: str,
     content: list[dict[str, Any]],
     created_by: str | None = None,
+    stable_id: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -203,12 +214,26 @@ def record(
         e.g. ``"alice@example.com"``. ``None`` when unknown. Stored
         so :func:`resolve_oldest` can apply it to the persisted item
         and broadcast it via ``session.input.consumed``.
+    :param stable_id: Stable 32-char hex id assigned by the web client to this
+        logical message submit. When set, the transcript forwarder uses it
+        directly as the persisted item's id so the store-level append is
+        idempotent across client retries. ``None`` for clients that do not
+        send one.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
     """
-    pending_id = f"pending_{uuid.uuid4().hex}"
-    entry = _Entry(pending_id=pending_id, content=content, created_by=created_by)
     with _lock:
-        _evict_stale_locked(conversation_id, entry.created_at)
+        _evict_stale_locked(conversation_id, _now())
+        # If a live entry already carries this stable_id, return its pending_id
+        # without creating a new entry — the runner already received this message
+        # and re-dispatching it would duplicate the turn.
+        if stable_id is not None:
+            for existing in _pending.get(conversation_id, {}).values():
+                if existing.stable_id == stable_id:
+                    return existing.pending_id
+        pending_id = f"pending_{uuid.uuid4().hex}"
+        entry = _Entry(
+            pending_id=pending_id, content=content, created_by=created_by, stable_id=stable_id
+        )
         _pending.setdefault(conversation_id, {})[pending_id] = entry
     return pending_id
 
@@ -273,7 +298,98 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
             pending_id=entry.pending_id,
             content=copy.deepcopy(entry.content),
             created_by=entry.created_by,
+            stable_id=entry.stable_id,
         )
+
+
+def restore(conversation_id: str, drained: DrainedInput) -> None:
+    """
+    Put a drained entry back at the FRONT of the pending queue.
+
+    Compensation for a drain whose persist turned out to be a duplicate
+    (an idempotent external-item append deduplicated the retry): the
+    entry belongs to the NEXT user message, and it was the oldest when
+    drained, so it returns to the head to keep FIFO intact.
+
+    :param conversation_id: Conversation/session id, e.g.
+        ``"conv_abc123"``.
+    :param drained: The entry returned by :func:`resolve_oldest` or
+        :func:`resolve_matching_text`.
+    """
+    entry = _Entry(
+        pending_id=drained.pending_id,
+        content=copy.deepcopy(drained.content),
+        created_by=drained.created_by,
+        stable_id=drained.stable_id,
+    )
+    with _lock:
+        entries = _pending.get(conversation_id, {})
+        _pending[conversation_id] = {drained.pending_id: entry, **entries}
+
+
+def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
+    """
+    Drain through the first pending entry whose text matches ``text``.
+
+    Kiro persists accepted web prompts as structured ``Prompt`` records. If an
+    earlier injected web message errors before Kiro records a prompt, FIFO
+    draining would consume that failed entry when the next successful prompt is
+    mirrored, leaving the successful prompt stuck pending. This resolver lets
+    Kiro match the accepted prompt text and returns any older skipped entries so
+    the caller can surface them as failed web injections.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param text: Accepted prompt text mirrored from Kiro's structured JSONL.
+    :returns: Matched entry plus older skipped entries, or no match with an
+        empty skipped list when the text was typed directly in the TUI.
+    """
+    needle = _normalize_text(text)
+    if not needle:
+        return MatchedDrain(matched=None, skipped=[])
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return MatchedDrain(matched=None, skipped=[])
+        ordered = list(entries.items())
+        match_index: int | None = None
+        for index, (_pending_id, entry) in enumerate(ordered):
+            entry_text = _normalize_text(_content_text(entry.content))
+            # Exact match only: an unanchored suffix check ("noyes".endswith("yes"))
+            # can pick an unrelated queued entry whenever its text happens to trail
+            # a different accepted prompt, handing that entry's file attachments to
+            # the wrong persisted message. A miss falls through to "no match" below,
+            # the same fail-safe path already used for terminal-typed text.
+            if entry_text and needle == entry_text:
+                match_index = index
+                break
+        if match_index is None:
+            return MatchedDrain(matched=None, skipped=[])
+        skipped_entries = ordered[:match_index]
+        _matched_id, matched_entry = ordered[match_index]
+        for pending_id, _entry in ordered[: match_index + 1]:
+            entries.pop(pending_id, None)
+        if not entries:
+            _pending.pop(conversation_id, None)
+        return MatchedDrain(
+            matched=_drained_input(matched_entry),
+            skipped=[_drained_input(entry) for _pending_id, entry in skipped_entries],
+        )
+
+
+def has_pending(conversation_id: str) -> bool:
+    """
+    Report whether a session still holds an un-consumed message.
+
+    Cheap check for the session list: while a message waits for its runner
+    to boot, the session is working even though no turn has started yet.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` iff at least one non-stale pending entry exists.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        return bool(_pending.get(conversation_id))
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -314,6 +430,35 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
             }
             for entry in entries.values()
         ]
+
+
+def _drained_input(entry: _Entry) -> DrainedInput:
+    """Copy a pending entry into the public drained shape."""
+    return DrainedInput(
+        pending_id=entry.pending_id,
+        content=copy.deepcopy(entry.content),
+        created_by=entry.created_by,
+        stable_id=entry.stable_id,
+    )
+
+
+def _content_text(content: list[dict[str, Any]]) -> str:
+    """Extract text blocks from a pending-input content list."""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type in {"input_text", "text", "output_text"}:
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize text enough to compare pending input with Kiro Prompt text."""
+    return " ".join(text.split())
 
 
 def reset_for_tests() -> None:

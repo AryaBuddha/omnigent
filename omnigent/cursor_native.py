@@ -16,19 +16,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import TypedDict, cast
 
 import click
 import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -37,9 +41,11 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -50,10 +56,36 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_CURSOR_COMMAND = "cursor-agent"
 _CURSOR_PATH_ENV = "OMNIGENT_CURSOR_PATH"
+#: cursor chat ids (used as ``external_session_id``) are canonical UUIDs, e.g.
+#: ``0ef42bbf-3b80-4bec-ac39-ca46531cbc47``. This id flows into two untrusted
+#: sinks — a filesystem path component (the cursor chat-store dir) and the
+#: ``cursor-agent --resume`` argv — so both callers validate against this strict
+#: 8-4-4-4-12 shape before use (stricter than codex's loose hex+dash guard,
+#: because we know cursor mints full UUIDs). Anything else can never reach a path
+#: or argv.
+_CURSOR_CHAT_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def is_valid_cursor_chat_id(chat_id: str | None) -> bool:
+    """Return whether *chat_id* is a well-formed cursor chat id (UUID shape).
+
+    Used to gate the persisted ``external_session_id`` before it is used as a
+    cursor store-path component or passed to ``cursor-agent --resume``.
+    """
+    return chat_id is not None and _CURSOR_CHAT_ID_RE.fullmatch(chat_id) is not None
+
+
 _AGENT_NAME = "cursor-native-ui"
 _TERMINAL_NAME = "cursor"
 _TERMINAL_SESSION_KEY = "main"
@@ -88,12 +120,14 @@ class PreparedCursorTerminal:
         terminal was reused (the live-reattach path: prior chat is
         intact).
     :param cold_resumed: ``True`` when resuming an existing Omnigent
-        session whose terminal had already exited, so a *fresh*
-        ``cursor-agent`` TUI was launched with none of the prior turns.
-        Cursor records no resumable chat id, so this is genuinely a new
-        chat - distinct from a brand-new session (``resolved_session_id
-        is None``) and from a live reattach. Drives the honest
-        cold-resume stderr hint. Note: cursor deliberately treats
+        session whose terminal had already exited, so a new
+        ``cursor-agent`` TUI is launched. The forwarder persisted the
+        cursor chat id as ``external_session_id``, so the runner relaunches
+        with ``--resume <chatId>`` and the prior conversation is reloaded
+        (cursor reuses its chat store across ``--resume``). Distinct from a
+        brand-new session (``resolved_session_id is None``) and from a live
+        reattach. Drives the cold-resume stderr hint. Note: cursor
+        deliberately treats
         ``cold_resumed`` and ``reattached`` as mutually exclusive (the
         cold-resume path leaves ``reattached`` at its ``False`` default)
         - unlike ``claude_native`` which models them independently. This
@@ -107,6 +141,11 @@ class PreparedCursorTerminal:
     tmux_target: str | None
     reattached: bool
     cold_resumed: bool = False
+    #: The validated cursor chat id captured for this session, when a cold
+    #: resume will actually reload prior turns. ``None`` when no resumable id
+    #: was captured (first run, or the forwarder never persisted one), so the
+    #: cold resume genuinely starts a fresh chat — drives the honest hint.
+    resume_chat_id: str | None = None
 
 
 def _configured_cursor_command(env: Mapping[str, str]) -> str:
@@ -131,7 +170,7 @@ def resolve_cursor_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_cursor_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
             "Native Cursor requires the 'cursor-agent' CLI on PATH. Install it with: "
@@ -152,13 +191,136 @@ def build_cursor_launch(
     return NativeCursorLaunch(executable=executable, argv=[executable, *cursor_args])
 
 
+def _inject_mode_arg(
+    cursor_args: tuple[str, ...],
+    mode: str | None,
+) -> tuple[str, ...]:
+    """Return *cursor_args* with ``--mode <mode>`` prepended when appropriate.
+
+    No-op when *mode* is ``None`` or ``--mode`` / ``--plan`` is already present
+    in *cursor_args* (user-supplied value wins).
+    """
+    if mode is None:
+        return cursor_args
+    if any(arg in ("--mode", "--plan") or arg.startswith("--mode=") for arg in cursor_args):
+        return cursor_args
+    return ("--mode", mode, *cursor_args)
+
+
+_CURSOR_MODEL_LINE_RE = re.compile(r"^(?P<id>\S+)\s+-\s+(?P<name>.+?)(?:\s+\((?P<tags>[^)]*)\))?$")
+_CURSOR_VARIANT_SUFFIX_RE = re.compile(
+    r"(?:-(?:extra-high|thinking|xhigh|medium|high|low|none|max|fast))+$"
+)
+_CURSOR_DOTTED_CLAUDE_RE = re.compile(
+    r"^claude-(?P<major>\d+)\.(?P<minor>\d+)-(?P<family>[a-z][a-z0-9-]*)$"
+)
+_CURSOR_UNMAPPED_CLAUDE_RE = re.compile(r"^claude-\d+(?:\.\d+)?-[a-z][a-z0-9-]*$")
+_CURSOR_DISPLAY_SUFFIXES = frozenset(
+    {"1m", "none", "low", "medium", "high", "max", "thinking", "extra", "fast"}
+)
+
+
+class CursorModelOption(TypedDict):
+    """One model picker row parsed from ``cursor-agent models``."""
+
+    id: str
+    displayName: str
+    isDefault: bool
+    isCurrent: bool
+
+
+class _CursorSessionPatch(TypedDict, total=False):
+    terminal_launch_args: list[str]
+    model_override: str
+
+
+class _CursorSessionMetadata(TypedDict, total=False):
+    labels: dict[str, str]
+    terminal_launch_args: list[str]
+
+
+def _cursor_base_model_id(compound_id: str) -> str:
+    """Normalize a Cursor model/variant id to its injectable base id."""
+    base_id = _CURSOR_VARIANT_SUFFIX_RE.sub("", compound_id)
+    dotted_claude = _CURSOR_DOTTED_CLAUDE_RE.fullmatch(base_id)
+    if dotted_claude is None:
+        return base_id
+    return "claude-{family}-{major}-{minor}".format(**dotted_claude.groupdict())
+
+
+def _cursor_base_display_name(display_name: str) -> str:
+    """Remove variant labels from a Cursor model display name."""
+    words = display_name.split()
+    while words and words[-1].lower() in _CURSOR_DISPLAY_SUFFIXES:
+        words.pop()
+    return " ".join(words)
+
+
+def parse_cursor_cli_model_options(output: str) -> list[CursorModelOption]:
+    """Parse ``cursor-agent models`` output into base-model picker rows."""
+    options_by_id: dict[str, CursorModelOption] = {}
+    default_model_id: str | None = None
+    current_model_id: str | None = None
+    for raw_line in output.splitlines():
+        match = _CURSOR_MODEL_LINE_RE.fullmatch(raw_line.strip())
+        if match is None:
+            continue
+        model_id = _cursor_base_model_id(match.group("id"))
+        if _CURSOR_UNMAPPED_CLAUDE_RE.fullmatch(model_id):
+            _logger.warning("Skipping non-injectable Cursor model id %r", model_id)
+            continue
+        display_name = _cursor_base_display_name(match.group("name")) or model_id
+        tags = {tag.strip().lower() for tag in (match.group("tags") or "").split(",")}
+        options_by_id.setdefault(
+            model_id,
+            {
+                "id": model_id,
+                "displayName": display_name,
+                "isDefault": False,
+                "isCurrent": False,
+            },
+        )
+        if "default" in tags and default_model_id is None:
+            default_model_id = model_id
+        if "current" in tags and current_model_id is None:
+            current_model_id = model_id
+    options = list(options_by_id.values())
+    if not options:
+        raise ValueError("cursor-agent model list did not contain any valid models")
+    for option in options:
+        option["isDefault"] = option["id"] == default_model_id
+        option["isCurrent"] = option["id"] == current_model_id
+    return options
+
+
+def list_cursor_cli_model_options(
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout_s: float = 10.0,
+) -> list[CursorModelOption]:
+    """Discover base-model picker options from the installed Cursor CLI."""
+    executable = resolve_cursor_executable(env=env)
+    completed = subprocess.run(
+        [executable, "models"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        env=dict(env) if env is not None else None,
+    )
+    return parse_cursor_cli_model_options(completed.stdout)
+
+
 def run_cursor_native(
     *,
     server: str | None,
     session_id: str | None,
-    cursor_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    cursor_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
+    model: str | None = None,
     auto_open_conversation: bool = False,
+    mode: str | None = None,
 ) -> None:
     """
     Launch the Cursor TUI in an Omnigent terminal.
@@ -167,16 +329,25 @@ def run_cursor_native(
     :param session_id: Optional existing Omnigent conversation id.
     :param cursor_args: Raw cursor-agent CLI args to persist for the runner-owned TUI.
     :param resume_picker: ``True`` runs the cursor-native picker.
+    :param model: Optional Cursor model id persisted as the session
+        ``model_override`` (the runner applies it as ``--model``), e.g.
+        ``"gpt-5.2"``.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after launch.
+    :param mode: Optional cursor-agent execution mode (``"plan"`` or ``"ask"``).
+        Injected as ``--mode <mode>`` unless already present in *cursor_args*.
     :returns: None after the terminal attach session ends.
     """
+    cursor_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=cursor_args, legacy_param="cursor_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
             "Cursor requires a resolved Omnigent server URL. The CLI should call "
             "_ensure_backend before run_cursor_native."
         )
+    effective_cursor_args = _inject_mode_arg(cursor_args, mode)
     with TemporaryDirectory(prefix="omnigent-cursor-native-") as tmpdir:
         spec_path = _materialize_cursor_agent_spec(Path(tmpdir))
         _run_with_remote_server(
@@ -184,7 +355,8 @@ def run_cursor_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            cursor_args=cursor_args,
+            cursor_args=effective_cursor_args,
+            model=model,
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -197,7 +369,7 @@ def _materialize_cursor_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "cursor-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: dict[str, object] = {
         "name": _AGENT_NAME,
         "prompt": (
             "Cursor is running in the session terminal. The user drives the "
@@ -210,17 +382,9 @@ def _materialize_cursor_agent_spec(tmpdir: Path) -> Path:
             "cwd": ".",
             "sandbox": {"type": "none"},
         },
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # Default shell terminal for the web-UI "+ New shell" affordance;
+        # its command follows the user's ``$SHELL`` (zsh/fish/bash).
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
@@ -233,6 +397,7 @@ def _run_with_remote_server(
     session_id: str | None,
     resume_picker: bool,
     cursor_args: tuple[str, ...],
+    model: str | None = None,
     auto_open_conversation: bool = False,
 ) -> None:
     """
@@ -243,13 +408,14 @@ def _run_with_remote_server(
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the cursor-native picker.
     :param cursor_args: Raw cursor-agent CLI args.
+    :param model: Optional Cursor model id persisted as ``model_override``.
     :param auto_open_conversation: Whether to open the web conversation URL.
     """
     from omnigent.chat import _bundle_agent, _remote_headers
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -272,6 +438,7 @@ def _run_with_remote_server(
                     session_id=resolved_session_id,
                     session_bundle=bundle,
                     cursor_args=cursor_args,
+                    model=model,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
@@ -284,7 +451,15 @@ def _run_with_remote_server(
                 warn=lambda message: click.echo(message, err=True),
             )
             if prepared.cold_resumed:
-                echo_native_cold_resume_hint(agent_label="Cursor")
+                # Only promise restoration when a valid chat id was actually
+                # captured: then the runner injects ``--resume <chatId>`` and
+                # cursor (which reuses its chat store across ``--resume``)
+                # reloads the prior turns. With no captured id the runner injects
+                # nothing and cursor starts fresh, so the hint must say so.
+                echo_native_cold_resume_hint(
+                    agent_label="Cursor",
+                    restored=prepared.resume_chat_id is not None,
+                )
             await _attach_terminal_resource(prepared)
             if resolved_session_id is None:
                 echo_native_resume_hint(
@@ -309,6 +484,7 @@ async def _prepare_cursor_terminal_via_daemon(
     session_id: str | None,
     session_bundle: bytes | None,
     cursor_args: tuple[str, ...],
+    model: str | None = None,
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
@@ -316,26 +492,37 @@ async def _prepare_cursor_terminal_via_daemon(
     """
     Create or resume a cursor-native session through a daemon runner.
 
+    :param model: Optional Cursor model id persisted as the session
+        ``model_override`` (the runner applies it as ``--model``).
     :returns: Prepared terminal details for attaching.
     """
     persist_args = list(cursor_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         # Resuming an existing session can either reattach to a live
         # terminal (prior chat intact) or, if that terminal has exited,
         # cold-start a fresh TUI. We only know which after probing for a
         # running terminal below, so default both flags off here.
         reattached = False
         cold_resumed = False
+        fresh_session = session_id is None
+        resume_chat_id: str | None = None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Cursor session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Cursor session...")
-            session_id = await _create_cursor_session(
-                client,
-                session_bundle,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_cursor_session(
+                    client,
+                    session_bundle,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
+            # Persist the model pin before the runner binds and launches the
+            # TUI (it reads model_override from the snapshot to build --model).
+            if model is not None:
+                await _patch_cursor_session(client, session_id, {"model_override": model})
         else:
             _update_startup_progress(startup_progress, "Loading Cursor session...")
             payload = await _fetch_cursor_session(client, session_id)
@@ -349,9 +536,9 @@ async def _prepare_cursor_terminal_via_daemon(
                 )
             existing_terminal = await _find_running_cursor_terminal(client, session_id)
             if existing_terminal is not None:
-                if persist_args:
+                if persist_args or model is not None:
                     click.echo(
-                        "Ignoring Cursor launch args for an already-running terminal; "
+                        "Ignoring Cursor launch args/model for an already-running terminal; "
                         "restart the session terminal to apply them.",
                         err=True,
                     )
@@ -363,33 +550,43 @@ async def _prepare_cursor_terminal_via_daemon(
                     tmux_target=existing_terminal.tmux_target,
                     reattached=True,
                 )
-            # Session exists but its terminal has exited. Cursor records no
-            # resumable chat id, so the launch below starts a fresh TUI with
-            # no prior turns. Flag it so the caller can say so honestly.
-            # Mutually exclusive with the reattach path above: we leave
-            # reattached at False here (unlike claude_native, which treats
-            # cold_resumed/reattached as independent). Safe because cursor
-            # never uses reattached for teardown ownership.
+            # Session exists but its terminal has exited. The forwarder
+            # persists the cursor chat id as external_session_id, so the
+            # runner's _auto_create_cursor_terminal will pass
+            # ``--resume <chatId>`` to cursor-agent and the TUI reloads
+            # the prior conversation. Flag cold_resumed so the caller can
+            # show an honest hint. Mutually exclusive with the reattach
+            # path above: we leave reattached at False here (unlike
+            # claude_native, which treats cold_resumed/reattached as
+            # independent). Safe because cursor never uses reattached for
+            # teardown ownership.
             cold_resumed = True
+            # The hint below should only promise "prior conversation resumed"
+            # when a valid chat id was actually captured; otherwise the runner
+            # injects no ``--resume`` and cursor starts fresh. Read it from the
+            # same session payload and validate it (the runner re-validates
+            # before use; this keeps the user-facing message honest).
+            ext = payload.get("external_session_id") if isinstance(payload, dict) else None
+            if isinstance(ext, str) and is_valid_cursor_chat_id(ext):
+                resume_chat_id = ext
+            patch: _CursorSessionPatch = {}
             if persist_args:
+                patch["terminal_launch_args"] = persist_args
+            if model is not None:
+                patch["model_override"] = model
+            if patch:
                 _update_startup_progress(startup_progress, "Updating Cursor session...")
-                resp = await client.patch(
-                    f"/v1/sessions/{url_component(session_id)}",
-                    json={"terminal_launch_args": persist_args},
-                )
-                if resp.status_code >= 400:
-                    raise click.ClickException(
-                        f"Cursor session launch config update failed "
-                        f"({resp.status_code}): {error_text(resp)}"
-                    )
+                await _patch_cursor_session(client, session_id, patch)
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
@@ -409,6 +606,7 @@ async def _prepare_cursor_terminal_via_daemon(
         tmux_target=terminal.tmux_target,
         reattached=reattached,
         cold_resumed=cold_resumed,
+        resume_chat_id=resume_chat_id,
     )
 
 
@@ -419,7 +617,7 @@ async def _create_cursor_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first cursor-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _CursorSessionMetadata = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -439,7 +637,30 @@ async def _create_cursor_session(
     return new_session_id
 
 
-async def _fetch_cursor_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _patch_cursor_session(
+    client: httpx.AsyncClient,
+    session_id: str,
+    patch: _CursorSessionPatch,
+) -> None:
+    """
+    PATCH a cursor-native session's persisted launch config.
+
+    :param client: Omnigent server HTTP client.
+    :param session_id: Conversation id to update.
+    :param patch: Fields to persist, e.g. ``{"model_override": "gpt-5.2"}``.
+    :raises click.ClickException: If the server rejects the update.
+    """
+    resp = await client.patch(
+        f"/v1/sessions/{url_component(session_id)}",
+        json=patch,
+    )
+    if resp.status_code >= 400:
+        raise click.ClickException(
+            f"Cursor session launch config update failed ({resp.status_code}): {error_text(resp)}"
+        )
+
+
+async def _fetch_cursor_session(client: httpx.AsyncClient, session_id: str) -> dict[str, object]:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:
@@ -449,9 +670,9 @@ async def _fetch_cursor_session(client: httpx.AsyncClient, session_id: str) -> d
             f"Failed to fetch conversation {session_id!r} ({resp.status_code}): {error_text(resp)}"
         )
     payload = resp.json()
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not all(isinstance(key, str) for key in payload):
         raise click.ClickException("Conversation fetch returned non-object JSON.")
-    return payload
+    return cast(dict[str, object], payload)
 
 
 async def _ensure_cursor_terminal_on_runner(client: httpx.AsyncClient, session_id: str) -> None:

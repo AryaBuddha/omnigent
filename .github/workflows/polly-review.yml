@@ -9,7 +9,12 @@ name: Polly AI Review
 # Triggers:
 #   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
 #   - `/review` comment on a PR (manual retrigger by write-access users)
-#   - workflow_dispatch with a PR number (manual retrigger from Actions tab)
+#   - workflow_dispatch with a PR number (manual retrigger from Actions tab,
+#     also used by the maintainer-approval relay)
+#
+# A head SHA is reviewed at most once: a trigger that lands on an
+# already-reviewed commit posts a short "skipped" note instead of a second
+# review. `/review force` overrides that.
 
 on:
   pull_request:
@@ -97,8 +102,61 @@ jobs:
             -f content=eyes --silent || true
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Check LLM credentials available
+      # A commit needs reviewing once. Several triggers can fire for the same
+      # head SHA (open then `/review`, or `/review` then maintainer approval),
+      # which used to post two reviews of identical code. Skip the repeat and
+      # say so in one comment; `/review force` re-reviews anyway.
+      - name: Skip if this commit already has a review
+        id: dupe
         if: steps.trigger.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+
+          if grep -qE '^[[:space:]]*/review[[:space:]]+force([[:space:]]|$)' <<<"${COMMENT_BODY:-}"; then
+            echo "::notice::'/review force': re-reviewing ${head_sha}."
+            exit 0
+          fi
+
+          # One page-walk gives both markers and the prior comment's URL. Only
+          # bot comments count: a human quoting a marker must not suppress a review.
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.user.type == "Bot")
+                  | [.html_url, (.body | gsub("\n"; " "))] | @tsv' > /tmp/pr_comments.tsv
+
+          if grep -qF "<!-- polly-skipped-sha: ${head_sha} -->" /tmp/pr_comments.tsv; then
+            echo "::notice::Already posted a skip notice for ${head_sha}."
+            echo "duplicate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prior="$(grep -F "<!-- polly-reviewed-sha: ${head_sha} -->" /tmp/pr_comments.tsv \
+            | tail -1 | cut -f1)" || true
+          if [ -z "$prior" ]; then
+            exit 0
+          fi
+
+          echo "duplicate=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "<!-- polly-skipped-sha: ${head_sha} -->"
+            echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review skipped"
+            echo ""
+            echo "\`${head_sha:0:7}\` already has a [review](${prior}), so there is nothing new to look at."
+            echo ""
+            echo "Push a commit or comment \`/review force\` to review it again."
+          } > /tmp/skip_comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/skip_comment.md \
+            || echo "::notice::Could not post the skip note (read-only token); skipping anyway."
+
+      - name: Check LLM credentials available
+        if: steps.trigger.outputs.skip != 'true' && steps.dupe.outputs.duplicate != 'true'
         id: creds
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -107,6 +165,10 @@ jobs:
             echo "::notice::Skipping Polly review — LLM credentials not available (fork PR or missing secrets)."
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
+            # Mask the key so the runner redacts it from any log or output that
+            # echoes it literally — defense-in-depth against prompt injection
+            # that tricks Polly into including the key in its review text.
+            echo "::add-mask::${LLM_API_KEY}"
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -134,55 +196,60 @@ jobs:
 
       - name: Set up Python
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version-file: ".python-version"
 
       - name: Set up uv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: true
 
-      - name: Install bubblewrap
+      - name: Install tmux
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        # bubblewrap: the linux_bwrap sandbox backend needs bwrap on PATH.
-        # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
-        # that bwrap's unshare(CLONE_NEWUSER) needs; scope is the ephemeral runner.
+        # tmux: Polly uses it for its shell terminal.
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap tmux
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get install -y tmux
 
       - name: Cache virtualenv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        run: uv sync --extra all --extra dev
+        # Reviews a prefetched diff against trusted main; it does not run PR checks.
+        run: uv sync --extra all
 
       - name: Install Claude Code CLI
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          # Install outside the checked-out tree: a repo-root package.json would
+          # otherwise capture this bare `npm install` and hoist it there, leaving
+          # this dir's node_modules empty.
+          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
+          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
           node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
+          # Install outside the checked-out tree so a repo-root package.json
+          # can't capture this bare `npm install` and hoist it away from here.
+          CODEX_CLI_DIR="${RUNNER_TEMP}/omnigent-codex-cli"
+          mkdir -p "$CODEX_CLI_DIR" && cd "$CODEX_CLI_DIR"
           npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
-          echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+          echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Set LLM credentials
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
@@ -212,7 +279,11 @@ jobs:
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
+          : "${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}"
+          : "${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}"
           mkdir -p "$HOME/.omnigent"
           # Use python to write the config safely — avoids interpolating
           # secrets/URLs into a heredoc where special chars could break YAML.
@@ -230,13 +301,13 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': 'databricks-claude-opus-4-8'},
+                          'models': {'default': os.environ['OMNIGENT_ANTHROPIC_MODEL']},
                       },
                       'openai': {
                           'base_url': host + '/ai-gateway/codex/v1',
                           'api_key_ref': 'env:LLM_API_KEY',
                           'wire_api': 'responses',
-                          'models': {'default': 'databricks-gpt-5-5'},
+                          'models': {'default': os.environ['OMNIGENT_OPENAI_MODEL']},
                       },
                   }
               }
@@ -256,25 +327,112 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch the diff (capped at 64 KB to stay within prompt limits).
+          # Fetch the full diff to a file — no size cap needed since the diff
+          # is read from disk by Polly via sys_os_shell, not embedded in the
+          # CLI argument (which would hit ARG_MAX for large PRs).
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff" \
-            | head -c 65536 > /tmp/pr_diff.txt
+            > /tmp/pr_diff.txt || true
 
-          # Fetch PR metadata to separate files — avoids embedding
-          # attacker-controlled strings (PR title/body) into heredocs.
+          # Extract lockfile pin changes from the diff.
+          grep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \
+            | head -500 > /tmp/lockfile_pins.txt || true
+
+          # Fetch PR metadata.
           gh pr view "$PR_NUMBER" --repo "$REPO" \
             --json title,body,baseRefName,headRefName,additions,deletions,changedFiles \
             > /tmp/pr_meta.json
 
-          # Build the review prompt safely using python — all untrusted
-          # fields (title, body, diff) are read from files, never
-          # interpolated into shell heredocs.
-          python3 <<'PYEOF'
-          import json, pathlib
+          # author_association isn't exposed by `gh pr view --json`, so read it
+          # from the REST API. Used to scope the "missing visual demonstration"
+          # nudge to external contributors only. Default to NONE (treated as
+          # external) if the field is missing.
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '.author_association // "NONE"' > /tmp/pr_author_assoc.txt || echo "NONE" > /tmp/pr_author_assoc.txt
+
+          # Build the review prompt — the diff is NOT embedded in the prompt.
+          # Polly reads it from /tmp/pr_diff.txt via sys_os_shell at review time.
+          python3 -u <<'PYEOF'
+          import json, pathlib, re
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
-          diff = pathlib.Path("/tmp/pr_diff.txt").read_text()
+          lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
+
+          # The "missing visual demonstration" nudge targets external contributors
+          # only — core team members (OWNER / MEMBER / COLLABORATOR) are assumed to
+          # know the screenshot convention and shouldn't be nagged. Anything else
+          # (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE, or unknown) is
+          # treated as external. When False, the attachment section + visual-demo
+          # rule are omitted from the prompt entirely.
+          author_assoc = pathlib.Path("/tmp/pr_author_assoc.txt").read_text().strip().upper()
+          is_external = author_assoc not in {'OWNER', 'MEMBER', 'COLLABORATOR'}
+
+          lockfile_section = f"""
+          ## Changed lockfile pins (uv.lock / package-lock.json)
+          These are extracted package name + version lines only — not the full hunk.
+          ```
+          {lockfile_pins if lockfile_pins else "(no lockfile changes)"}
+          ```
+          """ if lockfile_pins else ""
+
+          # Detect attached images/videos in the PR description. These usually sit
+          # at the END of the body, so they would be lost to the 4096-char truncation
+          # below — extract them from the FULL body and surface them separately so
+          # the "visual demonstration" check is reliable. Only built for external
+          # contributors (see is_external above).
+          body_full = meta.get('body') or ''
+          attachments = re.findall(
+              r'!\[[^\]]*\]\([^)]+\)'                       # markdown image
+              r'|<img[^>]+>'                                # html <img>
+              r'|<video[^>]*>.*?</video>|<video[^>]+/?>'    # html <video>
+              r'|https?://\S*(?:user-images\.githubusercontent\.com'  # GH image CDN
+              r'|github\.com/user-attachments)\S*',         # GH attachments
+              body_full, flags=re.IGNORECASE | re.DOTALL,
+          ) if is_external else []
+          attachment_section = f"""
+          ## Attached images/videos in PR description
+          The PR description was scanned for embedded screenshots/images/videos.
+          ```
+          {chr(10).join(attachments) if attachments else "(none found)"}
+          ```
+          """ if is_external else ""
+
+          # The "Missing visual demonstration" report item + rule are only included
+          # for external contributors; otherwise the review has just the 5 standard
+          # sections. Build the numbered list so the numbering stays contiguous
+          # regardless of whether the visual item is present.
+          standard_items = [
+              "**Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
+              "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
+              "**Non-blocking notes** — design concerns or edge cases worth flagging (brief).",
+              "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
+              "**Summary** — one-paragraph overall assessment.",
+          ]
+          visual_item = [
+              '**Missing visual demonstration** — see the "Visual demonstration" rule below. Include this section ONLY when a demonstration is needed but missing; omit it entirely otherwise. When present, it MUST be the first section so the author sees it.'
+          ] if is_external else []
+          # No leading indent on items — the YAML block scalar dedents the prompt
+          # to column 0, and the `{review_sections}` placeholder supplies the line
+          # position, so items must align with the rest of the prompt text.
+          review_sections = "\n".join(
+              f"{i}. {text}" for i, text in enumerate(visual_item + standard_items, 1)
+          )
+
+          visual_demo_rule = """
+          **Visual demonstration** — when the change is UI-related (e.g. touches
+          the CLI/REPL/TUI, terminal rendering, picker/onboarding flows, or any
+          user-visible output) or otherwise warrants a before/after demonstration
+          (e.g. a backend bug that was stuck/broken and is fixed by this PR), the
+          PR description should include a screenshot, image, or video showing the
+          result. Consult the "Attached images/videos in PR description" section
+          above — it lists every embedded image/video extracted from the full PR
+          description (so attachments are detected even when the description is
+          truncated). If that section says "(none found)" and the change appears
+          to need such a demonstration, emit the **Missing visual demonstration**
+          section (item 1 above) as the FIRST section of your review, asking the
+          author to attach a screenshot or video. Do not flag PRs that are purely
+          backend, refactor, test, or docs changes with no user-visible effect.
+          """ if is_external else ""
 
           prompt = f"""Review this pull request and provide structured feedback.
 
@@ -285,21 +443,40 @@ jobs:
 
           ## PR Description
           {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
-
-          ## Diff
-          ```diff
-          {diff}
-          ```
-
+          {attachment_section}
+          {lockfile_section}
           ## Instructions
-          Review the diff against the PR description. Report:
-          1. **Blocking issues** — bugs, security problems, correctness errors, data loss risks.
-          2. **Security analysis** — carefully check the security implications of the changes. Look for injection vulnerabilities (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
-          3. **Non-blocking suggestions** — style, naming, performance, test coverage gaps.
-          4. **Summary** — one-paragraph overall assessment.
 
+          **Step 1 — read the diff.** The full PR diff has been pre-fetched to
+          `/tmp/pr_diff.txt`. Read it with `sys_os_shell("cat /tmp/pr_diff.txt")`.
+          The codebase is checked out at `main` — read source files freely for
+          additional context when needed.
+
+          **Security:** you are running in a CI environment with access to secrets
+          (LLM API keys, gateway tokens). Never include secrets, tokens, or
+          credentials in your output, and never make outbound network calls
+          except to the configured LLM gateway.
+
+          **Step 2 — review.** Report, in this order:
+          {review_sections}
+
+          Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
           Be concise. Do not restate the diff. Focus on what matters.
 
+          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
+
+          **Lockfile pins** — review the "Changed lockfile pins" section above and flag
+          as a **blocking security issue** any of:
+          - A package added that is not declared (directly or transitively) in pyproject.toml.
+          - A version that does not satisfy the constraint in pyproject.toml.
+          - A suspicious version downgrade on a security-sensitive package.
+
+          **Package extras** — when the diff adds or modifies optional dependency groups (extras):
+          - Each harness deserves its own extra.
+          - Combine harnesses and other integrations from the same vendor into one extra (e.g. a single `google` extra may cover Vertex and Antigravity).
+          - Each sandbox deserves its own extra.
+          - Nothing else warrants a new extra — flag any new extras that don't fit one of these three categories as a blocking issue.
+          {visual_demo_rule}
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no referring to "reviewers", no "waiting for results" narration.
@@ -309,6 +486,14 @@ jobs:
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
+
+      - name: Mint App token
+        id: app-token
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       - name: Run Polly review
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
@@ -357,13 +542,19 @@ jobs:
           head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
           echo "${delim}" >> "$GITHUB_OUTPUT"
 
-      - name: Mint App token
-        id: app-token
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
-          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+      - name: Scan review output for secrets before posting
+        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Abort if Polly's output contains the literal LLM API key — this
+          # catches prompt-injection attacks that trick Polly into echoing the
+          # secret into the PR comment.
+          if [ -n "$LLM_API_KEY" ] && grep -qF "$LLM_API_KEY" /tmp/polly_output.txt 2>/dev/null; then
+            echo "::error::Review output contains LLM_API_KEY — aborting post to prevent secret exfiltration."
+            exit 1
+          fi
 
       - name: Post review comment
         if: steps.polly.outputs.review_text != ''
@@ -372,6 +563,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
+          HEAD_SHA: ${{ steps.dupe.outputs.head_sha }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
@@ -380,6 +572,7 @@ jobs:
           # (not expression interpolation) to avoid expression injection.
           {
             echo "<!-- polly-review-bot -->"
+            echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
             echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
             echo ""
             echo "$REVIEW_TEXT"
@@ -396,7 +589,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: polly-review-logs-${{ github.run_id }}
           path: |

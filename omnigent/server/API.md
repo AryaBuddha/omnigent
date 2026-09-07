@@ -287,22 +287,22 @@ Query parameters:
   "object": "list",
   "data": [
     {"id": "msg_aaa", "response_id": "resp_001", "type": "message",
-     "role": "user", "status": "completed",
+     "role": "user", "status": "completed", "created_at": 1774118382,
      "content": [{"type": "input_text", "text": "What's the weather?"}]},
     {"id": "msg_bbb", "response_id": "resp_001", "model": "my-agent", "type": "message",
-     "role": "assistant", "status": "completed",
+     "role": "assistant", "status": "completed", "created_at": 1774118384,
      "content": [{"type": "output_text", "text": "It's sunny in SF.", "annotations": []}]},
     {"id": "msg_ccc", "response_id": "resp_002", "type": "message",
-     "role": "user", "status": "completed",
+     "role": "user", "status": "completed", "created_at": 1774118401,
      "content": [{"type": "input_text", "text": "And tomorrow?"}]},
     {"id": "fc_ddd", "response_id": "resp_002", "model": "my-agent", "type": "function_call",
-     "status": "completed", "name": "get_weather",
+     "status": "completed", "created_at": 1774118403, "name": "get_weather",
      "arguments": "{\"location\": \"SF\", \"date\": \"tomorrow\"}", "call_id": "call_001"},
     {"id": "fco_eee", "response_id": "resp_002", "type": "function_call_output",
-     "status": "completed",
+     "status": "completed", "created_at": 1774118404,
      "call_id": "call_001", "output": "{\"forecast\": \"rain\", \"high\": 58}"},
     {"id": "msg_fff", "response_id": "resp_002", "model": "my-agent", "type": "message",
-     "role": "assistant", "status": "completed",
+     "role": "assistant", "status": "completed", "created_at": 1774118406,
      "content": [{"type": "output_text", "text": "Rain expected, high of 58°F.", "annotations": []}]}
   ],
   "first_id": "msg_aaa",
@@ -471,7 +471,7 @@ Fields:
     means no override is active and the bound agent's spec model
     applies. Persisted on `conversations.model_override`; set via
     `PATCH /v1/sessions/{id}` (also the path the REPL's `/model`
-    command uses) so the ap-web picker and the TUI stay in sync.
+    command uses) so the web picker and the TUI stay in sync.
 
   cost_control_mode_override (string or null)
     Per-session cost-control switch: `"on"` activates the spec's
@@ -570,7 +570,7 @@ Request parts:
 
 The server stores the bundle, then creates the `conversations` row
 and the session-scoped `agents` row in one database transaction. The
-new agent row has `agents.session_id` set to the new conversation id,
+new agent row has `agents.kind` set to `'session'`,
 and `conversations.agent_id` points at that agent. If the database
 agent write fails, the conversation row rolls back. If multipart or
 bundle parsing fails, no database row is written.
@@ -738,6 +738,9 @@ When runner liveness is wired (and not skipped via
 DELETE /v1/sessions/{session_id}[?delete_branch=true]
 
 200 OK — {"id": "conv_abc123", "deleted": true}
+409 Conflict — `delete_branch=true` but the host/runner is offline,
+  so worktree cleanup cannot run. Delete without the flag, or wait
+  for the runner to reconnect.
 404 Not Found — no session with that id
 403 Forbidden — caller is not the session owner
 ```
@@ -750,8 +753,10 @@ files, and the conversation row.
     server-created worktree (`git_branch` set), the host removes the
     worktree directory and deletes its branch (`git worktree remove
     --force` then `git branch -D`). Ignored for sessions with no
-    worktree. Best-effort: a cleanup failure does not block the
-    delete. See `designs/SESSION_GIT_WORKTREE.md`.
+    worktree. If the host tunnel is down, the delete is rejected
+    with 409 rather than a misleading 404; a host-reported git
+    failure is still logged and does not block the delete. See
+    `designs/SESSION_GIT_WORKTREE.md`.
 
 ### Bind Session Runner
 
@@ -835,6 +840,11 @@ serves create-bind, resume-bind, and recover-bind: the client starts a
 runner, waits for registration, then PATCHes the session to the new
 runner id. The write replaces any previous value in
 `conversations.runner_id`; no history table is maintained.
+
+### Codex-specific APIs
+
+Codex-native session routes, including the Codex Goal subresource, are
+documented in [codex-API.md](codex-API.md).
 
 ### Post Event
 
@@ -1168,6 +1178,7 @@ stream and surface queue/interrupt semantics.
 | `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
+| `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |
