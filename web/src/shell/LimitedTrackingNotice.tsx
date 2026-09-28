@@ -9,8 +9,8 @@ import type { WorkspaceChangesTrackingReason } from "@/hooks/useWorkspaceChanged
 const MESSAGES: Record<WorkspaceChangesTrackingReason, string> = {
   non_git_workspace:
     "This workspace isn't a Git repository, so only files edited through the agent's " +
-    "built-in file tools are listed. Changes made by the agent's own CLI, shell " +
-    "commands, or other processes won't appear here.",
+    "file tools are listed. Changes made by shell commands or other programs won't " +
+    "appear here.",
   no_workspace: "This session has no tracked workspace, so file changes can't be listed here.",
 };
 
