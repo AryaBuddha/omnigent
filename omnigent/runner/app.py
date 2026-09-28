@@ -9882,10 +9882,8 @@ def create_runner_app(
                 "object": "list",
                 "data": data,
                 "has_more": False,
-                # Whether the list captures every working-tree edit.  Git
-                # workspaces are complete; non-git workspaces track only agent
-                # tool-call edits (``tracking.reason`` says why), so the UI can
-                # surface the limitation instead of an ambiguous empty list.
+                # Git workspaces are complete; non-git ones track only agent
+                # tool-call edits, so the UI can explain a partial list.
                 "tracking": {
                     "complete": tracking_complete,
                     "reason": tracking_reason,

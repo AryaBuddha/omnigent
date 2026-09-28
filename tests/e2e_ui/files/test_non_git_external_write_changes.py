@@ -1,24 +1,12 @@
 """E2E: a non-git workspace's Changes panel must surface that tracking is limited.
 
-In a session whose workspace is not a git repo, changes are tracked by
-``AgentEditFilesystemRegistry``, which has no filesystem watcher and records
-only writes routed through ``record_change()`` (``sys_os_write`` / ``sys_os_edit``
-and the REST PUT/PATCH filesystem endpoints). A file written straight to disk
-by any other process — a native-harness CLI, a ``sys_os_shell`` command, or an
-external editor — lands on disk but never reaches the registry, so
-``GET .../environments/{id}/changes`` stays empty. A bare empty list is
-indistinguishable from "nothing changed": the Workspace rail's Changes tab used
-to show "No workspace changes yet" even though a file changed on disk, and no
-diff appeared (``isDiffAvailable`` depends on the list).
-
-This drives the reported user journey end to end with no interception: a
-runner-bound session pinned to a plain non-git workspace, a file written
-straight to disk by an external process (standing in for a native CLI /
-``sys_os_shell`` write), the session page opened in the SPA, and the Workspace
-rail's Changes tab selected. Full non-git tracking is out of scope; the panel
-must instead say that change tracking is limited and why. On an unfixed build
-the panel shows only "No workspace changes yet", so this test fails there —
-the regression guard for the fix.
+Outside a git repo only writes routed through ``record_change()`` (the agent's
+file tools and the REST filesystem endpoints) are tracked, so a file written
+straight to disk by a native-harness CLI, ``sys_os_shell`` or an external editor
+never reaches ``GET .../changes``. The Changes tab used to render the bare
+"No workspace changes yet" state for it, indistinguishable from a clean
+workspace. This drives that journey end to end in the real SPA, server and
+runner and expects the limited-tracking notice instead.
 """
 
 from __future__ import annotations
@@ -52,11 +40,9 @@ def non_git_external_write_session(
 ) -> Iterator[tuple[str, str, Path]]:
     """A runner-bound session in a non-git workspace with an external on-disk write.
 
-    The workspace is a plain (non-git) directory pinned via ``metadata.workspace``,
-    which is what the runner's per-session filesystem registry resolves against.
-    A file is written straight to disk before the session opens — an external
-    write that never goes through ``record_change()``, exactly what a native
-    harness CLI or a ``sys_os_shell`` command does.
+    The plain directory is pinned via ``metadata.workspace``, which the runner's
+    per-session registry resolves against; the file is written before the
+    session opens, bypassing ``record_change()`` like a native CLI does.
 
     :param live_server: Spawned server fixture; its runner is reused.
     :param tmp_path: Per-test dir for the non-git workspace (outside any repo).

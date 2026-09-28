@@ -205,9 +205,8 @@ export function FlatFileList({
    */
   runnerWentOffline?: boolean;
   /**
-   * Whether change tracking captures every edit. `false` for non-git
-   * workspaces (only the agent's file-tool edits are recorded), which shows a
-   * notice so a partial — often empty — list doesn't read as "no changes".
+   * Whether change tracking captures every edit; `false` shows a notice so a
+   * partial (often empty) list doesn't read as "no changes".
    */
   trackingComplete?: boolean;
   /** Why tracking is limited; drives the notice copy. */

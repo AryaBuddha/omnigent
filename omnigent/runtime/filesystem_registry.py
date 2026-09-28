@@ -99,11 +99,8 @@ class GitStatusUnavailable(RuntimeError):
         self.reason = reason
 
 
-# Machine-readable reasons surfaced in the ``GET …/changes`` response's
-# ``tracking.reason`` field when change tracking cannot observe every
-# working-tree edit.  The web UI maps these to an explanatory notice in the
-# Files "changes" panel so a necessarily-partial list does not read as a
-# definitive "no changes".
+# ``tracking.reason`` values in the ``GET …/changes`` response; the web UI maps
+# them to the limited-tracking notice.
 TRACKING_LIMIT_NON_GIT = "non_git_workspace"
 TRACKING_LIMIT_NO_WORKSPACE = "no_workspace"
 
@@ -504,13 +501,9 @@ class FilesystemRegistry(ABC):
     def tracks_all_changes(self) -> bool:
         """Whether the registry observes *every* working-tree change.
 
-        ``True`` means changes are reported regardless of which process made
-        them (e.g. :class:`GitFilesystemRegistry`, backed by ``git status``).
-        ``False`` (the default) means only edits routed through
-        :meth:`record_change` — the agent's write/edit tool calls and the REST
-        filesystem endpoints — are visible; files written by a native-harness
-        CLI, ``sys_os_shell``, or any external process are missed.  Callers use
-        this to tell the UI that the changes list may be incomplete.
+        ``True`` for git-backed tracking (``git status`` sees every process's
+        writes). ``False``, the default, means only edits routed through
+        :meth:`record_change` are visible, so the changes list may be partial.
         """
         return False
 
@@ -518,10 +511,8 @@ class FilesystemRegistry(ABC):
     def tracking_limit_reason(self) -> str | None:
         """Machine-readable reason change tracking is incomplete.
 
-        ``None`` when :attr:`tracks_all_changes` is ``True``.  Otherwise one of
-        the ``TRACKING_LIMIT_*`` constants (e.g. :data:`TRACKING_LIMIT_NON_GIT`),
-        surfaced verbatim in the ``GET …/changes`` response so the web UI can
-        explain *why* tracking is limited rather than showing a bare empty list.
+        ``None`` when :attr:`tracks_all_changes` is ``True``; otherwise one of
+        the ``TRACKING_LIMIT_*`` constants, surfaced verbatim in ``GET …/changes``.
         """
         return None
 
@@ -659,9 +650,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
     def tracking_limit_reason(self) -> str | None:
         """Non-git workspaces track only agent tool-call edits.
 
-        :returns: :data:`TRACKING_LIMIT_NON_GIT` — external/shell/native-CLI
-            writes never reach :meth:`record_change`, so the changes list is
-            necessarily partial.  (:attr:`tracks_all_changes` stays ``False``.)
+        :returns: :data:`TRACKING_LIMIT_NON_GIT`; writes that bypass
+            :meth:`record_change` never reach the changes list.
         """
         return TRACKING_LIMIT_NON_GIT
 
@@ -999,10 +989,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
     @property
     def tracks_all_changes(self) -> bool:
-        """``git status`` reflects every working-tree change regardless of which
-        process wrote it, so git-backed tracking is complete.
+        """``git status`` sees every working-tree write, so tracking is complete.
 
-        :returns: ``True``.  (:attr:`tracking_limit_reason` stays ``None``.)
+        :returns: ``True``.
         """
         return True
 

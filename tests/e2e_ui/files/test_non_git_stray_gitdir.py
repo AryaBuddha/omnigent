@@ -117,10 +117,8 @@ def test_non_git_workspace_under_stray_gitdir_settles_without_error(
     expect(changes_tab).to_have_attribute("aria-selected", "true")
 
     # A non-git workspace has no git status to fail: the panel must settle to
-    # the limited-tracking notice (only agent file-tool edits are listed
-    # outside git). A build that misroots the workspace on the stray ``.git``
-    # shows "Failed to load: 502 ..." here instead, so this assertion is what
-    # fails on the broken path.
+    # the limited-tracking notice. A build that misroots the workspace on the
+    # stray ``.git`` shows "Failed to load: 502 ..." here instead.
     expect(rail.get_by_text("Limited change tracking")).to_be_visible(timeout=30_000)
 
     # And the failure line must never render for a non-git workspace.

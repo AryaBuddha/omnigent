@@ -2,14 +2,9 @@ import { InfoIcon } from "lucide-react";
 import type { WorkspaceChangesTrackingReason } from "@/hooks/useWorkspaceChangedFiles";
 
 /**
- * Shown atop the Changed-files panel when the runner reports that change
- * tracking can't observe every edit (`tracking.complete === false`). Without
- * it, a non-git workspace — where only the agent's own file-tool edits are
- * recorded — shows a bare empty list that reads as a definitive "no changes",
- * even though native-CLI, shell, or external writes did change files on disk.
- *
- * Mirrors {@link RunnerAsleepHint}'s compact icon + title + description layout
- * so the panel's degraded states read consistently.
+ * Shown atop the Changed-files panel when the runner reports incomplete
+ * tracking (`tracking.complete === false`), so a non-git workspace's partial
+ * list is not read as "no changes". Mirrors {@link RunnerAsleepHint}'s layout.
  */
 const MESSAGES: Record<WorkspaceChangesTrackingReason, string> = {
   non_git_workspace:
