@@ -1590,33 +1590,36 @@ describe("useWorkspaceChangedFiles tracking signal", () => {
     return null;
   }
 
-  it("surfaces incomplete tracking with the non-git reason", async () => {
-    // A non-git workspace reports complete:false so the panel can warn that
-    // the (possibly empty) list misses CLI/shell/external edits.
-    onlineMock.mockReturnValue(true);
-    fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
-      jsonResponse({
-        object: "list",
-        data: [],
-        has_more: false,
-        tracking: { complete: false, reason: "non_git_workspace" },
-      }),
-    );
+  it.each(["non_git_workspace", "no_workspace"] as const)(
+    "surfaces incomplete tracking with the %s reason",
+    async (reason) => {
+      // Both recognized reasons must survive parsing so the panel can explain
+      // why the (possibly empty) list is partial.
+      onlineMock.mockReturnValue(true);
+      fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
+        jsonResponse({
+          object: "list",
+          data: [],
+          has_more: false,
+          tracking: { complete: false, reason },
+        }),
+      );
 
-    const seen: WorkspaceChangedFilesResult[] = [];
-    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
-    render(
-      <Wrap>
-        <ChangedFilesDataProbe id="conv_nongit" onData={onData} />
-      </Wrap>,
-    );
+      const seen: WorkspaceChangedFilesResult[] = [];
+      const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+      render(
+        <Wrap>
+          <ChangedFilesDataProbe id={`conv_${reason}`} onData={onData} />
+        </Wrap>,
+      );
 
-    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
-    const last = seen.at(-1) as WorkspaceChangedFilesResult;
-    expect(last.available).toBe(true);
-    expect(last.trackingComplete).toBe(false);
-    expect(last.trackingReason).toBe("non_git_workspace");
-  });
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+      const last = seen.at(-1) as WorkspaceChangedFilesResult;
+      expect(last.available).toBe(true);
+      expect(last.trackingComplete).toBe(false);
+      expect(last.trackingReason).toBe(reason);
+    },
+  );
 
   it("defaults to complete tracking when the runner omits the tracking field", async () => {
     // Older runners don't send `tracking`; treat that as complete so no

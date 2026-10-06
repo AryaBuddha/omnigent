@@ -222,11 +222,10 @@ export function FlatFileList({
   /** Why tracking is limited; drives the notice copy. */
   trackingReason?: WorkspaceChangesTrackingReason | null;
 }) {
-  // Shown whenever the runner reports incomplete tracking; loading/error states take precedence.
-  const limitedNotice =
-    !isLoading && !isError && !trackingComplete ? (
-      <LimitedTrackingNotice reason={trackingReason} />
-    ) : null;
+  // Shown above or instead of the list whenever the runner reports incomplete tracking.
+  const limitedNotice = !trackingComplete ? (
+    <LimitedTrackingNotice reason={trackingReason} />
+  ) : null;
   if (isLoading) {
     return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
   }
