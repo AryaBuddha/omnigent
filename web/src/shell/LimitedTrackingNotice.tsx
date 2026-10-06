@@ -4,7 +4,7 @@ import type { WorkspaceChangesTrackingReason } from "@/hooks/useWorkspaceChanged
 /**
  * Shown atop the Changed-files panel when the runner reports incomplete
  * tracking (`tracking.complete === false`), so a non-git workspace's partial
- * list is not read as "no changes". Mirrors {@link RunnerAsleepHint}'s layout.
+ * list is not read as "no changes". Mirrors RunnerAsleepHint's layout.
  */
 const MESSAGES: Record<WorkspaceChangesTrackingReason, string> = {
   non_git_workspace:

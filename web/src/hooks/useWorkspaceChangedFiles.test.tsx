@@ -1696,4 +1696,28 @@ describe("useWorkspaceChangedFiles tracking signal", () => {
     expect(last.trackingComplete).toBe(false);
     expect(last.trackingReason).toBeNull();
   });
+
+  it("treats a descriptor without a verdict as incomplete", async () => {
+    // Only an explicit complete: true hides the notice; a malformed descriptor
+    // fails toward showing it rather than toward a misleading empty list.
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(
+        jsonResponse({ object: "list", data: [], has_more: false, tracking: { reason: null } }),
+      );
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_no_verdict" onData={onData} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(false);
+    expect(last.trackingReason).toBeNull();
+  });
 });

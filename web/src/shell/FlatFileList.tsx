@@ -245,7 +245,6 @@ export function FlatFileList({
     );
   }
   if (!files || files.length === 0) {
-    // The notice replaces "no changes yet" so a partial list isn't read as "nothing changed".
     return (
       limitedNotice ?? (
         <p className="px-2 py-1 text-muted-foreground text-sm">No workspace changes yet</p>
