@@ -1,12 +1,10 @@
-"""E2E: a non-git workspace's Changes panel must surface that tracking is limited.
+"""E2E: an external write in a non-git workspace shows the limited-tracking notice.
 
 Outside a git repo only writes routed through ``record_change()`` (the agent's
 file tools, observed native-harness edits and the REST filesystem endpoints) are
-tracked, so a file written straight to disk by a shell command or an external
-editor never reaches ``GET .../changes``. The Changes tab used to render the bare
-"No workspace changes yet" state for it, indistinguishable from a clean
-workspace. This drives that journey end to end in the real SPA, server and
-runner and expects the limited-tracking notice instead.
+tracked, so a file written by a shell command or an external editor never
+reaches ``GET .../changes``. The real SPA, server and runner must then show the
+limited-tracking notice rather than the bare empty state.
 """
 
 from __future__ import annotations
@@ -89,8 +87,8 @@ def test_non_git_external_write_surfaces_limited_tracking(
 
     assert target.exists(), "fixture did not write the external file to disk"
 
-    # The externally written file is invisible to the non-git registry: full
-    # tracking is out of scope, so the changes list stays empty across the fix.
+    # External writes bypass record_change, so the non-git registry never sees
+    # this file and the changes list stays empty.
     resp = httpx.get(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/changes",
         timeout=30.0,
@@ -115,7 +113,6 @@ def test_non_git_external_write_surfaces_limited_tracking(
     expect(rail.get_by_text("Limited change tracking")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(re.compile("isn't a Git repository"))).to_be_visible()
 
-    # The silent empty state — the buggy rendering — must not appear, and the
-    # degraded state is an explanation, not a load failure.
+    # Neither the bare empty state nor a load-failure line may render here.
     expect(rail.get_by_text("No workspace changes yet")).to_have_count(0)
     expect(rail.get_by_text(re.compile(r"^Failed to load:"))).to_have_count(0)
