@@ -222,9 +222,7 @@ export function FlatFileList({
   /** Why tracking is limited; drives the notice copy. */
   trackingReason?: WorkspaceChangesTrackingReason | null;
 }) {
-  // Rendered above the list (or in place of the empty state) whenever the
-  // runner reports incomplete tracking. Suppressed while loading/erroring,
-  // where a more specific state already shows.
+  // Shown whenever the runner reports incomplete tracking; loading/error states take precedence.
   const limitedNotice =
     !isLoading && !isError && !trackingComplete ? (
       <LimitedTrackingNotice reason={trackingReason} />

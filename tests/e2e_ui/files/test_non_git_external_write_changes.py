@@ -62,9 +62,9 @@ def non_git_external_write_session(
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]
-    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
-    (workspace / _EXTERNAL_FILE).write_text(_EXTERNAL_CONTENT)
     try:
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
+        (workspace / _EXTERNAL_FILE).write_text(_EXTERNAL_CONTENT)
         yield (live_server, session_id, workspace)
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)

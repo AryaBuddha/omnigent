@@ -1666,4 +1666,31 @@ describe("useWorkspaceChangedFiles tracking signal", () => {
     expect(last.trackingComplete).toBe(true);
     expect(last.trackingReason).toBeNull();
   });
+
+  it("keeps tracking incomplete but drops a reason it does not recognize", async () => {
+    // A newer runner may send a reason this build doesn't know; the panel must
+    // still show the notice, with the neutral explanation rather than a guess.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
+      jsonResponse({
+        object: "list",
+        data: [],
+        has_more: false,
+        tracking: { complete: false, reason: "future_reason" },
+      }),
+    );
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_future_reason" onData={onData} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(false);
+    expect(last.trackingReason).toBeNull();
+  });
 });

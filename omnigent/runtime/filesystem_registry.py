@@ -556,8 +556,10 @@ class FilesystemRegistry(ABC):
     def tracking_limit_reason(self) -> str | None:
         """Machine-readable reason change tracking is incomplete.
 
-        ``None`` when :attr:`tracks_all_changes` is ``True``; otherwise one of
-        the ``TRACKING_LIMIT_*`` constants, surfaced verbatim in ``GET …/changes``.
+        Limited registries override this with a ``TRACKING_LIMIT_*`` constant,
+        surfaced verbatim in ``GET …/changes``. ``None`` alongside the base
+        default ``tracks_all_changes=False`` is an unspecified limitation, which
+        the UI reports neutrally.
         """
         return None
 
