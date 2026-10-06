@@ -1,9 +1,9 @@
 """E2E: a non-git workspace's Changes panel must surface that tracking is limited.
 
 Outside a git repo only writes routed through ``record_change()`` (the agent's
-file tools and the REST filesystem endpoints) are tracked, so a file written
-straight to disk by a native-harness CLI, ``sys_os_shell`` or an external editor
-never reaches ``GET .../changes``. The Changes tab used to render the bare
+file tools, observed native-harness edits and the REST filesystem endpoints) are
+tracked, so a file written straight to disk by a shell command or an external
+editor never reaches ``GET .../changes``. The Changes tab used to render the bare
 "No workspace changes yet" state for it, indistinguishable from a clean
 workspace. This drives that journey end to end in the real SPA, server and
 runner and expects the limited-tracking notice instead.
@@ -11,7 +11,6 @@ runner and expects the limited-tracking notice instead.
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 from collections.abc import Iterator
@@ -21,6 +20,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
     _ensure_runner_online,
@@ -42,7 +42,7 @@ def non_git_external_write_session(
 
     The plain directory is pinned via ``metadata.workspace``, which the runner's
     per-session registry resolves against; the file is written before the
-    session opens, bypassing ``record_change()`` like a native CLI does.
+    session opens, bypassing ``record_change()`` like an external editor does.
 
     :param live_server: Spawned server fixture; its runner is reused.
     :param tmp_path: Per-test dir for the non-git workspace (outside any repo).
@@ -56,20 +56,16 @@ def non_git_external_write_session(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     bundle = _build_hello_world_bundle()
-    create = httpx.post(
+    create = post_session_bundle(
+        httpx.post,
         f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({"workspace": str(workspace)})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        bundle,
+        metadata={"workspace": str(workspace)},
         timeout=30.0,
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]
-    patch = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
     try:
         yield (live_server, session_id, workspace)
     finally:
