@@ -260,6 +260,29 @@ describe("FlatFileList limited-tracking notice", () => {
     expect(screen.getByText("app.ts")).toBeInTheDocument();
   });
 
+  it("keeps the notice when every change is in a hidden file", () => {
+    renderList({
+      files: [changedFile(".env")],
+      trackingComplete: false,
+      trackingReason: "non_git_workspace",
+    });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/all changes are in hidden files/i)).toBeInTheDocument();
+  });
+
+  it("keeps the notice when the search matches no changed file", () => {
+    renderList({
+      files: [changedFile("src/app.ts")],
+      searchQuery: "zzz",
+      trackingComplete: false,
+      trackingReason: "non_git_workspace",
+    });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/no changed files match "zzz"/i)).toBeInTheDocument();
+  });
+
   it("uses the no-workspace copy for the no_workspace reason", () => {
     renderList({ files: [], trackingComplete: false, trackingReason: "no_workspace" });
 
