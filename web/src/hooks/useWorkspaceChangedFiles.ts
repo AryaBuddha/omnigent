@@ -234,7 +234,8 @@ interface ChangedFilesResponse {
 
 /**
  * Normalize the runner's `tracking` descriptor: missing (older runner) means
- * complete; an unrecognized reason collapses to `null`.
+ * complete, an unrecognized reason collapses to `null`, and a reason is only
+ * kept while tracking is incomplete.
  */
 function parseTracking(tracking: ChangedFilesResponse["tracking"]): {
   trackingComplete: boolean;
@@ -245,7 +246,8 @@ function parseTracking(tracking: ChangedFilesResponse["tracking"]): {
     tracking.reason === "non_git_workspace" || tracking.reason === "no_workspace"
       ? tracking.reason
       : null;
-  return { trackingComplete: tracking.complete !== false, trackingReason: reason };
+  const trackingComplete = tracking.complete !== false;
+  return { trackingComplete, trackingReason: trackingComplete ? null : reason };
 }
 
 async function fetchWorkspaceChangedFiles(

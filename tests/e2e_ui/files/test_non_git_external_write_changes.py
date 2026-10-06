@@ -41,8 +41,8 @@ def non_git_external_write_session(
     """A runner-bound session in a non-git workspace with an external on-disk write.
 
     The plain directory is pinned via ``metadata.workspace``, which the runner's
-    per-session registry resolves against; the file is written before the
-    session opens, bypassing ``record_change()`` like an external editor does.
+    per-session registry resolves against; the file is written once the session
+    is bound, bypassing ``record_change()`` like an external editor does.
 
     :param live_server: Spawned server fixture; its runner is reused.
     :param tmp_path: Per-test dir for the non-git workspace (outside any repo).
@@ -51,7 +51,6 @@ def non_git_external_write_session(
     """
     workspace = tmp_path / "plain-folder"
     workspace.mkdir()
-    (workspace / _EXTERNAL_FILE).write_text(_EXTERNAL_CONTENT)
 
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
@@ -66,6 +65,7 @@ def non_git_external_write_session(
     create.raise_for_status()
     session_id = create.json()["session_id"]
     bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
+    (workspace / _EXTERNAL_FILE).write_text(_EXTERNAL_CONTENT)
     try:
         yield (live_server, session_id, workspace)
     finally:

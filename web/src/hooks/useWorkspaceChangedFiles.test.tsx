@@ -1604,9 +1604,10 @@ describe("useWorkspaceChangedFiles tracking signal", () => {
     );
 
     const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
     render(
       <Wrap>
-        <ChangedFilesDataProbe id="conv_nongit" onData={(d) => seen.push(d)} />
+        <ChangedFilesDataProbe id="conv_nongit" onData={onData} />
       </Wrap>,
     );
 
@@ -1626,9 +1627,37 @@ describe("useWorkspaceChangedFiles tracking signal", () => {
       .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
 
     const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
     render(
       <Wrap>
-        <ChangedFilesDataProbe id="conv_legacy" onData={(d) => seen.push(d)} />
+        <ChangedFilesDataProbe id="conv_legacy" onData={onData} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(true);
+    expect(last.trackingReason).toBeNull();
+  });
+
+  it("drops a reason the runner sends alongside complete tracking", async () => {
+    // A reason only explains incomplete tracking; never surface one next to
+    // trackingComplete: true, whatever the server happened to send.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
+      jsonResponse({
+        object: "list",
+        data: [],
+        has_more: false,
+        tracking: { complete: true, reason: "non_git_workspace" },
+      }),
+    );
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_complete_reason" onData={onData} />
       </Wrap>,
     );
 

@@ -318,7 +318,7 @@ def test_non_git_create_file(
     # The response must flag limited tracking for this non-git workspace so the
     # UI can say why the list is partial instead of reading it as "no changes".
     changes_body = non_git_client.get(_changes_url(session_id)).json()
-    assert changes_body["tracking"] == {
+    assert changes_body.get("tracking") == {
         "complete": False,
         "reason": "non_git_workspace",
     }, (

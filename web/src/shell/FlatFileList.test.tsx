@@ -267,6 +267,16 @@ describe("FlatFileList limited-tracking notice", () => {
     expect(screen.getByText(/no tracked workspace/i)).toBeInTheDocument();
   });
 
+  it("uses a neutral fallback when the runner gives no recognized reason", () => {
+    // An unrecognized reason still means tracking is incomplete, but the UI
+    // must not guess at a cause such as "isn't a Git repository".
+    renderList({ files: [], trackingComplete: false, trackingReason: null });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/some edits may not be listed here/i)).toBeInTheDocument();
+    expect(screen.queryByText(/isn't a git repository/i)).not.toBeInTheDocument();
+  });
+
   it("shows the normal empty state (no notice) when tracking is complete", () => {
     // Git workspaces report complete tracking, so an empty list genuinely
     // means nothing changed — keep the plain empty state.

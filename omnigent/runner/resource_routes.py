@@ -1158,11 +1158,9 @@ def register_resource_routes(
         session_registry = await _resolve_session_fs_registry(session_id)
         if session_registry is not None:
             try:
-                # ``list_changed_files`` shells out to ``git status`` synchronously,
-                # which on a large repo (cold untracked cache) can take seconds.
-                # Offload to a thread so it never blocks the event loop — a blocked
-                # loop can't answer the server's runner-stream relay probe and the
-                # session's first turn 503s with runner_unavailable.
+                # ``git status`` is synchronous and can take seconds on a large repo;
+                # offload it so a blocked event loop can't fail the server's relay
+                # probe (the session's first turn would 503 with runner_unavailable).
                 raw_changes = await _asyncio.to_thread(
                     session_registry.list_changed_files,
                     session_id,

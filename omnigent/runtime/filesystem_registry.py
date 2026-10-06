@@ -18,12 +18,10 @@ Use :func:`create_filesystem_registry` to obtain the correct implementation
 for a given workspace path.
 
 Both classes share the :class:`FilesystemRegistry` abstract base class, which
-defines the full public interface.  The base class also exposes
-:attr:`~FilesystemRegistry.tracks_all_changes` /
-:attr:`~FilesystemRegistry.tracking_limit_reason` so callers (the
-``GET …/changes`` endpoint) can tell the UI when a non-git workspace tracks
-only agent tool-call edits — surfacing the limitation instead of letting a
-necessarily-partial list read as a definitive "no changes".
+defines the full public interface.  Registries also expose tracking
+completeness and a machine-readable limitation reason
+(:attr:`~FilesystemRegistry.tracks_all_changes` /
+:attr:`~FilesystemRegistry.tracking_limit_reason`).
 """
 
 from __future__ import annotations

@@ -14,15 +14,17 @@ const MESSAGES: Record<WorkspaceChangesTrackingReason, string> = {
   no_workspace: "This session has no tracked workspace, so file changes can't be listed here.",
 };
 
+const FALLBACK_MESSAGE =
+  "Change tracking is limited for this workspace, so some edits may not be listed here.";
+
 export function LimitedTrackingNotice({
   reason,
 }: {
   reason: WorkspaceChangesTrackingReason | null;
 }) {
-  // Fall back to the non-git copy for an unknown/absent reason: that's the
-  // only way the runner flags incompleteness today, and it's the most useful
-  // explanation if a future reason arrives before the UI knows about it.
-  const message = (reason && MESSAGES[reason]) || MESSAGES.non_git_workspace;
+  // An unknown or absent reason still means tracking is incomplete; say so
+  // neutrally rather than guess at a cause the UI doesn't recognize.
+  const message = (reason && MESSAGES[reason]) || FALLBACK_MESSAGE;
   return (
     <div className="flex flex-col items-start gap-1 px-2 py-1.5 text-muted-foreground text-xs">
       <span className="flex items-center gap-1.5 font-medium text-foreground">
